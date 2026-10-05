@@ -1,0 +1,52 @@
+# --- pipeline output -------------------------------------------------------
+# Everything the pipeline produces. Frames come from a home lawn: houses,
+# plates, neighbours, pets. Never commit these.
+work/
+dataset/
+frames/
+labels/
+models/
+*.rknn
+*.onnx
+
+# --- ultralytics -----------------------------------------------------------
+runs/
+wandb/
+*.pt
+*.torchscript
+*.torchscript.pt
+
+# --- rknn-toolkit2 ---------------------------------------------------------
+# The compiler writes caches and intermediate build trees next to the model.
+*.rknn.cache
+rknn_build/
+calib_list.txt
+
+# --- datasets, general ----------------------------------------------------
+*.zip
+*.tar.gz
+datasets/
+
+# --- python ----------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+env/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+uv.lock
+
+# --- editors / OS ----------------------------------------------------------
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db

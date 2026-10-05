@@ -1,0 +1,341 @@
+# airseekers-yolo-retrain — single config for the whole pipeline
+#
+# Every script reads this file. Relative paths are resolved against the repository
+# root (the parent of scripts/), so the project can live anywhere.
+# Override anything from the command line, e.g.
+#
+#   python3 scripts/01_capture.py --set capture.duration_s=30
+#   python3 scripts/02_llm_label.py --set llm.base_url=http://192.168.1.50:1234/v1
+#
+# Script-specific flag names (--out, --model, ...) win over both --set and this file.
+
+version: 1
+
+paths:
+  work_dir: work                 # everything the pipeline produces lives here
+  frames_dir: work/frames       # 01: captured JPEGs + manifest.jsonl
+  labels_dir: work/labels       # 02: raw LLM responses, one JSON per frame
+  dataset_dir: work/dataset     # 03: images/{train,val} labels/{train,val} data.yaml
+  models_dir: work/models       # 05: .onnx and .rknn artefacts
+  runs_dir: runs                 # 04: ultralytics run directories
+
+# ---------------------------------------------------------------------------
+# Class vocabulary — this is an ABI, not a preference.
+#
+# The shipped detector (best_large_0208.rknn, det_ros) has a closed 22-class
+# vocabulary whose *order* is baked into the vendor's post-processing and into
+# the downstream fusion path. If you add, remove or reorder a name here, the
+# model you produce cannot be loaded by the vendor node as-is.
+#
+# Order below must match src/mower_perception/det_ros/model/best_large_list.txt.
+# ---------------------------------------------------------------------------
+classes:
+  names:
+    - person        # 0   recall-critical (safety)
+    - dog           # 1   recall-critical
+    - cat           # 2   recall-critical
+    - sports ball   # 3
+    - hedgehog      # 4   recall-critical
+    - rabbit        # 5   recall-critical
+    - stone         # 6
+    - hoe           # 7
+    - shovel        # 8
+    - manhole       # 9
+    - brick         # 10
+    - trashbin      # 11
+    - toycars       # 12
+    - potted plant  # 13
+    - cans          # 14
+    - bottle        # 15
+    - book          # 16
+    - backpack      # 17
+    - wood          # 18
+    - chair         # 19
+    - trunk         # 20
+    - dock          # 21  safety-relevant, rare: hand-label, do not trust the LLM
+  # Optional external source of truth. When set and readable it *replaces*
+  # `names`, so a vendor re-export cannot silently desync this file.
+  list_file: null
+  # Reported per-class by 03 and held to a higher recall bar in the QA gate.
+  recall_critical: [person, dog, cat, hedgehog, rabbit]
+
+# ---------------------------------------------------------------------------
+# Mower camera access — `web_video_server` MJPEG/snapshot over the LAN.
+#
+# Two stacks can be running on the mower, and they differ in port, topics and
+# whether the HTTP server is up at all. Pick one with `mower.profile` (or
+# `--profile` on 01_capture.py):
+#
+#   ros1  vendor firmware (ROS 1 Noetic). web_video_server on 8181, always on.
+#         OA + rear cameras are gated behind `<cam>/start_capture`.
+#         Docs: airseekers-decompile/docs/streaming-and-telemetry.md.
+#   ros2  the ROS 2 port (airseekers-decompile/ros2_stack). web_video_server on
+#         8080 is OFF by default: launch cameras.launch.py web_video_server:=true.
+#         No start_capture services. RTSP on 8554 comes from mediamtx
+#         (docker/docker-compose.video.yml) and is for viewers; 01 reads HTTP.
+#
+# Which frames matter: the ROS 2 det_ros consumes ONLY /left_oa_camera and
+# /right_oa_camera (GC2093, 1920x1080), letterboxed to 480 wide x 640 tall
+# with black (0) padding. The OA cameras are therefore the primary capture
+# source in both profiles. The vendor ROS 1 det_ros additionally read
+# /vio/right/image_raw (640x480); it is kept in the ros1 profile as secondary.
+# ---------------------------------------------------------------------------
+mower:
+  profile: ros1                  # ros1 | ros2
+  host: 192.168.1.105
+  base_url: null                 # null -> http://<host>:<profiles.<profile>.port>
+  # web_video_server endpoints; {topic} is substituted by the camera's topic.
+  stream_path: /stream?topic={topic}&type=mjpeg
+  snapshot_path: /snapshot?topic={topic}
+  connect_timeout_s: 5.0
+  read_timeout_s: 30.0
+  # web_video_server is roughly single-threaded (ros2: server_threads 2): a
+  # held stream can block a concurrent request. Keep simultaneous streams few.
+  max_concurrent_sources: 2
+
+# Camera presets per profile. `topic` must be a real image topic on the mower.
+#   mode: stream   = hold an MJPEG multipart connection, sample frames off it
+#   mode: snapshot = one HTTP GET per kept frame (polite, lower steady cost)
+# `rate_hz` is the *keep* rate after dedupe. A top-level `cameras:` block, if
+# you add one, replaces the profile's list (older configs keep working).
+profiles:
+  ros1:
+    port: 8181
+    silent_hints:
+      - "topic silent, or the camera needs: rosservice call {ns}/start_capture '{}'"
+      - "(mower_cam_keeper.service normally does this when a viewer subscribes)"
+      - "check the topic on the mower: rostopic hz {topic}"
+    cameras:
+      left_oa:
+        topic: /left_oa_camera/image_raw
+        mode: snapshot
+        rate_hz: 1.0
+        note: primary — det_ros input (GC2093 1920x1080); gated, needs start_capture
+      right_oa:
+        topic: /right_oa_camera/image_raw
+        mode: snapshot
+        rate_hz: 1.0
+        note: primary — det_ros input (GC2093 1920x1080); gated, needs start_capture
+      front:
+        topic: /vio/right/image_raw
+        mode: stream
+        rate_hz: 0.5
+        note: secondary — 640x480 stereo right eye; vendor ROS 1 det_ros read it, ROS 2 det_ros does not
+      front_left:
+        topic: /vio/left/image_raw
+        mode: stream
+        rate_hz: 0.25
+        note: stereo left eye; not consumed by any det_ros, extra data only
+      rear:
+        topic: /rear_camera/image_raw
+        mode: snapshot
+        rate_hz: 0.25
+        note: rear view feeds mower_charge dock detection — keep the rate low
+  ros2:
+    port: 8080
+    rtsp: rtsp://<mower>:8554/{rear,left_oa}   # mediamtx relay, viewers only
+    silent_hints:
+      - "web_video_server is off by default in the ROS 2 stack:"
+      - "  ros2 launch mower_bringup cameras.launch.py web_video_server:=true"
+      - "check the topic on the mower: ros2 topic hz {topic}"
+    cameras:
+      left_oa:
+        topic: /left_oa_camera/image_raw
+        mode: stream
+        rate_hz: 1.0
+        note: primary — det_ros input (GC2093 1920x1080)
+      right_oa:
+        topic: /right_oa_camera/image_raw
+        mode: stream
+        rate_hz: 1.0
+        note: primary — det_ros input (GC2093 1920x1080)
+      rear:
+        topic: /rear_camera/image_raw
+        mode: snapshot
+        rate_hz: 0.25
+        note: not a det_ros input; extra data only, keep the rate low
+
+capture:
+  session: null                  # null -> timestamped, e.g. 20261005-142530
+  out_dir: work/frames
+  duration_s: 60                 # 0 = until interrupted
+  max_frames_per_camera: 500
+  # Near-duplicate rejection. A parked mower otherwise writes hundreds of
+  # identical JPEGs and quietly biases the dataset.
+  phash_min_distance: 6
+  # Stop a camera after this many consecutive near-duplicate rejections. Without
+  # it a static scene burns the whole session re-fetching the same picture —
+  # against a single-threaded web_video_server that is also rude to the mower.
+  stop_after_dup_run: 5
+  # Save the bytes exactly as received (reencode: false) or downscale with PIL.
+  reencode: false
+  jpeg_quality: 90
+  max_edge: 1280
+  quota_bytes: 2147483648        # 2 GiB per session: stop capturing, never raise
+  total_quota_bytes: 12884901888  # 12 GiB across sessions: prune oldest first
+  # Local-folder import instead of the mower (no mower needed).
+  folder:
+    path: null
+    recursive: true
+    extensions: [.jpg, .jpeg, .png, .bmp]
+    rate_hz: 5.0
+    videos: false                # true -> also decode videos with ffmpeg
+    video_rate_hz: 2.0
+    camera_name: folder
+
+# ---------------------------------------------------------------------------
+# Labelling — LM Studio (or anything OpenAI-compatible) on the LAN.
+# LM Studio default base URL: http://127.0.0.1:1234/v1  (Developer tab -> Start)
+# ---------------------------------------------------------------------------
+llm:
+  base_url: http://127.0.0.1:1234/v1
+  model: ""                      # empty -> discovered from GET /v1/models
+  api_key: lm-studio             # sent as a bearer token; LM Studio ignores it
+  # Vision-capable models that work with this client in LM Studio:
+  #   qwen2.5-vl-7b-instruct, qwen2.5-vl-3b-instruct, gemma-3-12b-it,
+  #   llama-3.2-vision-11b-instruct, smolvlm2-2.2b-instruct, moondream2
+  timeout_s: 180
+  max_retries: 3
+  retry_backoff_s: 2.0
+  concurrency: 2                 # one image per request; 2-4 is plenty
+  temperature: 0.0               # 0.0 or labels are not reproducible
+  max_tokens: 1024
+  top_p: 1.0
+  # json_object = ask for a JSON grammar; json_schema = pin the shape;
+  # none = prompt only (use if the loaded model rejects the parameter).
+  response_format: json_object
+  # Downscale before sending: cost + accuracy. 02 records the size actually
+  # sent (sent_width/sent_height in raw/*.json) because a model answering in
+  # pixels answers in THAT space; 03 rescales pixel boxes by original/sent.
+  max_edge: 1024
+  jpeg_quality: 85
+  # Frames to skip, glob patterns (these never reach the LLM).
+  skip_patterns: ["*_review*.jpg"]
+  system_prompt: |
+    You label robot-camera frames for a safety-relevant object detector.
+    Return ONLY JSON, no prose, no markdown fence:
+    {"boxes": [{"class": "<one of the allowed names>", "box": [x1, y1, x2, y2], "confidence": 0.0}]}
+    `box` is [left, top, right, bottom] in a 0-1000 normalized frame:
+    0 = left/top edge of the image, 1000 = right/bottom edge.
+    Allowed classes ONLY, spelled exactly:
+    person, dog, cat, sports ball, hedgehog, rabbit, stone, hoe, shovel,
+    manhole, brick, trashbin, toycars, potted plant, cans, bottle, book,
+    backpack, wood, chair, trunk, dock.
+    Rules: never invent a class name; never guess a class you cannot see;
+    return {"boxes": []} when nothing from the list is visible; tight axis-aligned
+    boxes; one entry per distinct object; never box the whole frame.
+  user_prompt: |
+    Label this frame. View: {view}. Objects at mower deck height, {condition}.
+  condition: daylight outdoor lawn
+  # {view} in user_prompt: the frame's topic from the manifest, else this.
+  view_hint: a robot mower camera at ground level
+  # Common synonyms mapped onto the closed vocabulary BEFORE the
+  # out-of-vocabulary check (lower-case keys). Merged over the built-in table
+  # in 02_llm_label.py; a value must be one of classes.names.
+  class_aliases: {}
+
+# ---------------------------------------------------------------------------
+# Validation + conversion to YOLO. This is the only step that can silently
+# poison the dataset, so the thresholds are deliberately conservative.
+# ---------------------------------------------------------------------------
+convert:
+  min_conf: 0.35                 # below this -> review queue, never a label
+  review_conf_max: 0.55          # 0.35-0.55 band -> review queue
+  max_boxes_per_frame: 12        # more than this = a bad response, not a scene
+  max_box_area_frac: 0.85        # ~whole-frame box = usually a hallucination
+  min_box_area_frac: 0.0005      # sub-pixel box = usually a hallucination
+  clamp: true                    # clip boxes to the frame instead of dropping
+  # auto | 0-1000 | 0-1 | pixels — how the LLM reported coordinates. `auto`
+  # infers per response and records the inference in provenance.jsonl.
+  coord_space: auto
+  # strict  = any single invalid box sends the whole frame to review/.
+  # lenient = drop the invalid boxes, keep the frame as an ACCEPT with the
+  #           valid ones (a "partial accept", noted in provenance.jsonl).
+  # Either way, a frame whose reply contained an out-of-vocabulary class, or
+  # a kept box in the min_conf..review_conf_max band, goes to review/.
+  bad_box_policy: lenient
+  dataset_dir: work/dataset
+  link_mode: hardlink            # hardlink | symlink | copy
+  val_fraction: 0.2
+  # Split by session (+ pose cell), never per frame: consecutive 1 Hz frames of
+  # the same rock in both train and val makes mAP fiction. Pose cells need an
+  # `odom: [x, y]` field in the capture manifest, which 01_capture.py does NOT
+  # write — without it session_pose is the same as session.
+  split_by: session_pose         # session | session_pose | frame
+  pose_bucket_m: 0.5
+  seed: 1234
+  keep_negatives: true           # {"boxes": []} frames are real training data
+
+# ---------------------------------------------------------------------------
+# Training (04). Notes for AMD RX 7900 XTX / ROCm are in the script header.
+# ---------------------------------------------------------------------------
+train:
+  weights: yolov8n.pt            # NOT a .rknn — see README "rknn is not a checkpoint"
+  data: work/dataset/data.yaml
+  # Training is square: ultralytics' trainer coerces any [h, w] to max(h, w)
+  # (check_imgsz(max_dim=1)), so a tuple here would be silently ignored. The
+  # 640x480 portrait geometry is set at EXPORT time (export.imgsz).
+  imgsz: 640
+  epochs: 150
+  patience: 25
+  batch: 32
+  device: auto                   # auto | 0 | 0,1 | cpu
+  workers: 8
+  project: runs
+  name: det_22cls
+  amp: auto                      # auto | true | false (RDNA3 needs false more often)
+  cache: false                   # false | ram | disk
+  val: true                      # run `yolo detect val` on best.pt afterwards
+  val_split: val
+  val_batch: 16
+
+# ---------------------------------------------------------------------------
+# ONNX export + rknn-toolkit2 conversion (05).
+# The input geometry, the preprocessing and the 9-output head are ABI for
+# det_ros — verify them before the model goes anywhere near the mower.
+# ---------------------------------------------------------------------------
+export:
+  weights: runs/det_22cls/weights/best.pt
+  onnx_name: best_22cls.onnx
+  opset: 12
+  simplify: true
+  half: false
+  dynamic: false
+  # [height, width] of the exported graph. det_ros input is NCHW [1,3,640,480]:
+  # 640 tall, 480 wide.
+  imgsz: [640, 480]
+  # airockchip   = airockchip/ultralytics_yolov8, YOLO(pt).export(format='rknn')
+  #                -> 9 outputs (box/cls/score_sum per stride, sigmoid in-graph).
+  #                This is what det_ros reads. Default.
+  # ultralytics  = stock `yolo export format=onnx` -> ONE [1,26,6300] output.
+  #                Fails the contract check; for comparison only.
+  exporter: airockchip
+  airockchip_repo: ../ultralytics_yolov8   # a git checkout; put on PYTHONPATH
+  rknn:
+    target_platform: rk3588
+    dtype: i8                     # i8 | fp
+    # Match the runtime det_ros actually loads; see README "version pinning".
+    # 05 refuses to convert with a different installed version unless you pass
+    # --reinstall-toolkit (which pip-installs exactly this version).
+    toolkit_version: "2.3.0"
+    # The shipped model is asymmetric int8, per-LAYER quantisation. The toolkit
+    # default is per-channel; A/B both against the fp build if accuracy drops.
+    quantized_dtype: w8a8
+    quantized_method: layer        # layer | channel
+    quantized_algorithm: normal    # normal | mmse | kl_divergence
+    # Preprocessing baked into the compiled model. These values match the
+    # shipped models' embedded quantization table; changing them silently
+    # degrades every box.
+    mean_values: [[0, 0, 0]]
+    std_values: [[255, 255, 255]]
+    calib_count: 300
+    calib_from: dataset           # dataset (dataset_dir/images) | frames (frames_dir)
+    # Share of the calibration set per camera (manifest `camera`), normalised.
+    # det_ros only ever sees the OA cameras, so they get most of the budget.
+    # '*' covers every other camera; cameras with no frames donate their share.
+    calib_camera_weights:
+      left_oa: 0.4
+      right_oa: 0.4
+      "*": 0.2
+    output_name: best_22cls.rknn
+    verify_metadata: true         # check input shape / output count of the .rknn
