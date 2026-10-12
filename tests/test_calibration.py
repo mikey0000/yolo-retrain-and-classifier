@@ -17,6 +17,32 @@ def test_letterbox_geometry_matches_mower_rknn():
     assert calib.letterbox_geometry(1920, 1080, 480, 640) == (480, 270, 0, 185, 0.25)
     # 640x480 vio frame: scale 0.75 -> 480x360, 140 px bands.
     assert calib.letterbox_geometry(640, 480, 480, 640) == (480, 360, 0, 140, 0.75)
+    # ROS 2 publish sizes: OA 960x540 (oa_publish_width) and rear 1280x720 both
+    # land exactly where a 1920x1080 frame does.
+    assert calib.letterbox_geometry(960, 540, 480, 640) == (480, 270, 0, 185, 0.5)
+    assert calib.letterbox_geometry(1280, 720, 480, 640) == (480, 270, 0, 185, 0.375)
+
+
+@pytest.mark.parametrize("size", [(960, 540), (640, 480), (1280, 720)])
+def test_letterbox_image_handles_every_ros2_camera_size(size):
+    from PIL import Image
+    out = calib.letterbox_image(Image.new("RGB", size, (200, 200, 200)), 480, 640)
+    nw, nh, px, py, _ = calib.letterbox_geometry(*size, 480, 640)
+    assert out.size == (480, 640)
+    assert out.getpixel((240, py - 1)) == (0, 0, 0)      # last band row
+    assert out.getpixel((240, py)) == (200, 200, 200)    # first image row
+    assert out.getpixel((240, py + nh - 1)) == (200, 200, 200)
+    assert out.getpixel((240, py + nh)) == (0, 0, 0)
+
+
+def test_config_calibration_weights_cover_every_det_ros_camera(cfg):
+    weights = cfg["export"]["rknn"]["calib_camera_weights"]
+    ros2 = set(cfg["profiles"]["ros2"]["cameras"])
+    assert ros2 <= set(weights)
+    # front (forward, feeds the costmaps) first, rear (gated) last
+    assert weights["front"] > weights["left_oa"] == weights["right_oa"] > weights["rear"] > 0
+    q = calib.allocate_quotas({c: 1000 for c in ros2}, 300, weights)
+    assert q == {"front": 105, "left_oa": 75, "right_oa": 75, "rear": 45}
 
 
 def test_letterbox_image_pads_black():

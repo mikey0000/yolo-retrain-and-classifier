@@ -31,7 +31,9 @@ Output::
     work/reference/<session>/<camera>/<seq>_<stamp_ns>.jpg   (cameras with `reference:`)
 
 Reference frames: a camera may name a ``reference`` topic, typically the
-onboard detector's annotated image (``/ai/det/image_annotated``). That topic is
+onboard detector's annotated image of the same camera (det_ros publishes
+``/<camera_ns>/image_annotated``, e.g. ``/vio/right/image_annotated``; the merged
+``/ai/det/image_annotated`` mixes all its cameras). That topic is
 held on one MJPEG connection and its latest frame is saved, under the same
 file name, next to every kept raw frame. The manifest records
 ``reference_path`` and ``reference_age_ms``. 02 can show it to the VLM as a hint
@@ -58,7 +60,7 @@ Examples
     # the two OA cameras det_ros reads, 60 s, rates from the config
     python3 scripts/01_capture.py --cameras left_oa,right_oa
 
-    # against the ROS 2 port (web_video_server:=true on port 8080)
+    # against the ROS 2 port (web_video_server on port 8080)
     python3 scripts/01_capture.py --profile ros2 --probe
 
     # explicit stream URL (any MJPEG server, mower or not)
@@ -132,7 +134,8 @@ def stream_from_config(cfg: dict, include_disabled: bool = False) -> list[Stream
 
     With ``mower.transport: rtsp`` every camera comes from the profile's
     ``rtsp_url`` template (the mediamtx relay) instead of web_video_server;
-    a camera may also carry its own ``rtsp:`` URL to opt in individually.
+    a camera may also carry its own ``rtsp:`` URL to opt in individually, or
+    ``rtsp: false`` to stay on HTTP (no relay path for it).
     Cameras with ``enabled: false`` are left out unless ``include_disabled``
     (``--cameras`` names them explicitly).
     """
@@ -147,8 +150,8 @@ def stream_from_config(cfg: dict, include_disabled: bool = False) -> list[Stream
                  f"not set in the config (or drop --transport rtsp and use "
                  f"--rtsp NAME=rtsp://... instead)")
     url_base = mower_base_url(cfg)
-    stream_tpl = get_dotted(cfg, "mower.stream_path", "/stream?topic={topic}&type=mjpeg")
-    snap_tpl = get_dotted(cfg, "mower.snapshot_path", "/snapshot?topic={topic}")
+    stream_tpl = get_dotted(cfg, "mower.stream_path", "/stream?topic={topic}&type=mjpeg&qos_profile=sensor_data")
+    snap_tpl = get_dotted(cfg, "mower.snapshot_path", "/snapshot?topic={topic}&qos_profile=sensor_data")
     specs: list[StreamSpec] = []
     for name, cam in cameras.items():
         if not isinstance(cam, dict) or "topic" not in cam:
@@ -161,8 +164,11 @@ def stream_from_config(cfg: dict, include_disabled: bool = False) -> list[Stream
         # The reference is always read over HTTP (web_video_server), whatever
         # transport the camera itself uses.
         reference = str(cam.get("reference") or "")
-        cam_tpl = str(cam.get("rtsp") or "")
-        if rtsp_transport == "rtsp" or cam_tpl:
+        # `rtsp: false` = the relay has no path for this camera: stay on HTTP
+        # even under mower.transport: rtsp.
+        http_only = cam.get("rtsp") is False
+        cam_tpl = "" if http_only else str(cam.get("rtsp") or "")
+        if (rtsp_transport == "rtsp" and not http_only) or cam_tpl:
             specs.append(StreamSpec(
                 name=name,
                 url=build_rtsp_url(cam_tpl or tpl, mower_host(cfg), name, topic),
@@ -192,7 +198,7 @@ def as_snapshot(cfg: dict, spec: StreamSpec) -> StreamSpec:
     if spec.topic:
         url = build_stream_url(mower_base_url(cfg),
                                get_dotted(cfg, "mower.snapshot_path",
-                                          "/snapshot?topic={topic}"), spec.topic)
+                                          "/snapshot?topic={topic}&qos_profile=sensor_data"), spec.topic)
     return dataclasses.replace(spec, mode="snapshot", url=url)
 
 
@@ -317,7 +323,7 @@ def probe(cfg: dict, specs: list[StreamSpec]) -> int:
 def reference_url(cfg: dict, topic: str) -> str:
     return build_stream_url(
         mower_base_url(cfg),
-        get_dotted(cfg, "mower.stream_path", "/stream?topic={topic}&type=mjpeg"), topic)
+        get_dotted(cfg, "mower.stream_path", "/stream?topic={topic}&type=mjpeg&qos_profile=sensor_data"), topic)
 
 
 class ReferenceFeed:
@@ -885,7 +891,7 @@ def main(argv: list[str] | None = None) -> int:
                                        "(default: every camera not `enabled: false`)")
     src.add_argument("--reference", metavar="TOPIC",
                      help="companion topic saved with every frame, e.g. "
-                          "/ai/det/image_annotated ('' disables; default: the "
+                          "/vio/right/image_annotated ('' disables; default: the "
                           "camera's `reference:`)")
 
     parser.add_argument("--out", help="output dir (default: capture.out_dir)")
@@ -944,7 +950,7 @@ def main(argv: list[str] | None = None) -> int:
         specs.extend(parse_url_specs(args.url))
     if args.topic:
         base = mower_base_url(cfg)
-        tpl = get_dotted(cfg, "mower.stream_path", "/stream?topic={topic}&type=mjpeg")
+        tpl = get_dotted(cfg, "mower.stream_path", "/stream?topic={topic}&type=mjpeg&qos_profile=sensor_data")
         specs.extend(parse_topic_specs(args.topic, base, tpl,
                                        float(args.rate or 1.0)))
     if not specs:

@@ -24,12 +24,18 @@ def test_profiles_default_cameras_and_hints_differ(common, capture, cfg):
     cfg["mower"]["profile"] = "ros1"
     assert list(common.camera_presets(cfg))[:2] == ["left_oa", "right_oa"]
     cfg["mower"]["profile"] = "ros2"
-    # ROS 2: only the vio right eye by default, paired with the onboard detector.
+    # ROS 2: the forward colour eye by default (the det_ros feed that reaches
+    # the costmaps), paired with det_ros' annotated image of THAT camera.
     specs = capture.stream_from_config(cfg)
     assert [(s.name, s.topic, s.reference) for s in specs] == [
-        ("front", "/vio/right/image_raw", "/ai/det/image_annotated")]
-    every = {s.name for s in capture.stream_from_config(cfg, include_disabled=True)}
-    assert {"front", "left_oa", "right_oa", "rear"} <= every
+        ("front", "/vio/right/image_color", "/vio/right/image_annotated")]
+    # Every det_ros input (det.yaml: left/right OA + front colour + rear) is
+    # in the preset; disabled ones are captured on --cameras.
+    every = {s.name: s.topic for s in capture.stream_from_config(cfg, include_disabled=True)}
+    assert every == {"front": "/vio/right/image_color",
+                     "left_oa": "/left_oa_camera/image_raw",
+                     "right_oa": "/right_oa_camera/image_raw",
+                     "rear": "/rear_camera/image_raw"}
     assert any("web_video_server:=true" in h for h in common.silent_topic_hint(cfg))
     cfg["mower"]["profile"] = "ros1"
     hints = common.silent_topic_hint(cfg, "/rear_camera/image_raw")
@@ -40,10 +46,15 @@ def test_specs_use_base_url_and_mode_specific_path(capture, cfg):
     cfg["mower"]["profile"] = "ros1"
     cfg["mower"]["base_url"] = "http://h:1"
     specs = {s.name: s for s in capture.stream_from_config(cfg)}
-    assert specs["left_oa"].url == "http://h:1/snapshot?topic=/left_oa_camera/image_raw"
+    # qos_profile=sensor_data: required by the ROS 2 web_video_server (the
+    # drivers publish best-effort), ignored by the ROS 1 one.
+    assert specs["left_oa"].url == ("http://h:1/snapshot?topic=/left_oa_camera/image_raw"
+                                    "&qos_profile=sensor_data")
     assert specs["front"].url.startswith("http://h:1/stream?topic=/vio/right/image_raw")
+    assert "qos_profile=sensor_data" in specs["front"].url
     snap = capture.as_snapshot(cfg, specs["front"])
-    assert snap.mode == "snapshot" and snap.url == "http://h:1/snapshot?topic=/vio/right/image_raw"
+    assert snap.mode == "snapshot" and snap.url == (
+        "http://h:1/snapshot?topic=/vio/right/image_raw&qos_profile=sensor_data")
 
 
 def test_session_budget_is_shared(capture):
@@ -112,7 +123,14 @@ def test_transport_rtsp_builds_profile_urls(cfg, capture):
     cfg["mower"]["transport"] = "rtsp"
     specs = {s.name: s for s in capture.stream_from_config(cfg, include_disabled=True)}
     assert set(specs) == {"front", "left_oa", "right_oa", "rear"}
-    assert all(s.mode == "rtsp" for s in specs.values())
+    # mediamtx relays only rear and left_oa; the others are `rtsp: false`
+    # and stay on web_video_server.
+    assert {n for n, s in specs.items() if s.mode == "rtsp"} == {"left_oa", "rear"}
+    assert specs["front"].mode == "stream"
+    assert specs["front"].url == ("http://192.168.1.105:8080/stream?topic=/vio/right/image_color"
+                                  "&type=mjpeg&qos_profile=sensor_data")
+    assert specs["right_oa"].mode == "stream"
+    assert specs["rear"].url == "rtsp://192.168.1.105:8554/rear"
     assert specs["left_oa"].url == "rtsp://192.168.1.105:8554/left_oa"
     assert specs["left_oa"].rate_hz == 1.0          # keep rate survives the switch
     assert specs["left_oa"].topic == "/left_oa_camera/image_raw"
