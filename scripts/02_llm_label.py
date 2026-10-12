@@ -21,8 +21,12 @@ Design decisions worth knowing before you tune anything:
 
 * **temperature 0 and one image per request.** A vision model's boxes drift
   between runs otherwise, so re-running the batch silently changes the dataset
-  and the training result is not reproducible. No multi-image or multi-turn
-  context: it makes small VLMs worse, not better.
+  and the training result is not reproducible. No multi-turn context.
+  The one exception is the *reference* image (``llm.use_reference``): when
+  01 saved the onboard detector's annotated frame for this frame, it is sent
+  as a second image, explicitly marked as a fallible hint. The model labels
+  the first image only. Off for frames whose reference has a different
+  aspect ratio (a different camera), because then it is the wrong scene.
 
 * **Every response is kept, including failures.** The raw JSON is the audit
   trail. If a batch came out wrong you can re-run or hand-fix without
@@ -47,6 +51,7 @@ Examples
 
     # from another machine: bind LM Studio to the LAN, then
     python3 scripts/02_llm_label.py --base-url http://192.168.1.50:1234/v1 --images ...
+    # (llm.base_url: auto tries localhost, then the Windows host when run in WSL)
 
     # single frame, print the raw reply (sanity-check coordinates before a batch)
     python3 scripts/02_llm_label.py --images work/frames/<session> --limit 1 --print-response
@@ -73,13 +78,22 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from common import (  # noqa: E402
     LOG, add_common_args, any_match, cfg_path, class_names, get_dotted,
     image_size_bytes, list_images, load_config, maybe_reencode, now_iso,
-    setup_logging, write_json_atomic,
+    resolve, resolve_llm_base_url, setup_logging, write_json_atomic,
 )
 
 try:
     import requests
 except ImportError:  # pragma: no cover
     sys.exit("ERROR: requests is required.  pip install requests")
+
+
+#: Text placed before the reference image when ``llm.use_reference`` is on.
+DEFAULT_REFERENCE_PROMPT = (
+    "Second image: the SAME scene with the robot's current onboard detector "
+    "output drawn on it (boxes and labels). It is a hint only — it misses "
+    "objects, mislabels things, and draws false boxes. Correct it: box every "
+    "allowed object you can actually see in the FIRST image, drop detections "
+    "that are wrong. Coordinates refer to the FIRST image.")
 
 
 # ---------------------------------------------------------------------------
@@ -152,6 +166,14 @@ class LabelerConfig:
     user_prompt: str
     condition: str
     view_hint: str
+    use_reference: bool = False
+    reference_prompt: str = ""
+    # Sent as `reasoning_effort` when set. "none" stops reasoning models
+    # (Qwen 3.x, Gemma 4, ...) thinking for hundreds of tokens per frame and
+    # running out of max_tokens before the JSON.
+    reasoning_effort: str = ""
+    # Send the reference only if its aspect ratio is within this of the frame's.
+    reference_max_aspect_diff: float = 0.03
 
 
 @dataclasses.dataclass
@@ -172,6 +194,7 @@ class Result:
     # space; 03 needs both to map those boxes back onto the frame.
     sent_size: tuple[int, int] = (0, 0)
     orig_size: tuple[int, int] = (0, 0)
+    reference_used: bool = False
 
 
 class Labeler:
@@ -262,7 +285,24 @@ class Labeler:
         data_url = "data:image/jpeg;base64," + base64.b64encode(payload).decode("ascii")
         return data_url, sent_size, orig_size
 
-    def build_body(self, data_url: str, view: str) -> dict:
+    def reference_url(self, ref: Path | None, orig_size: tuple[int, int]) -> str | None:
+        """Data URL for the reference image, or None when it should not be sent."""
+        if not (self.cfg.use_reference and ref and ref.is_file()):
+            return None
+        encoded = self.encode_image(ref)
+        if encoded is None:
+            return None
+        data_url, _sent, ref_size = encoded
+        if not (ref_size[1] and orig_size[1]):
+            return None
+        ratio = (ref_size[0] / ref_size[1]) / (orig_size[0] / orig_size[1])
+        if abs(ratio - 1.0) > self.cfg.reference_max_aspect_diff:
+            LOG.debug("reference %s is %dx%d, frame is %dx%d: different view, not sent",
+                      ref.name, *ref_size, *orig_size)
+            return None
+        return data_url
+
+    def build_body(self, data_url: str, view: str, ref_url: str | None = None) -> dict:
         body: dict = {
             "model": self.cfg.model,
             "temperature": self.cfg.temperature,
@@ -280,6 +320,13 @@ class Labeler:
                 ]},
             ],
         }
+        if self.cfg.reasoning_effort:
+            body["reasoning_effort"] = self.cfg.reasoning_effort
+        if ref_url:
+            body["messages"][1]["content"] += [
+                {"type": "text", "text": self.cfg.reference_prompt},
+                {"type": "image_url", "image_url": {"url": ref_url}},
+            ]
         if self._no_response_format:
             return body
         if self.cfg.response_format == "json_object":
@@ -312,15 +359,16 @@ class Labeler:
 
     # -- request ------------------------------------------------------------
 
-    def label_one(self, path: Path, view: str = "") -> Result:
+    def label_one(self, path: Path, view: str = "", reference: Path | None = None) -> Result:
         t0 = time.monotonic()
         encoded = self.encode_image(path)
         if encoded is None:
             return Result(path.stem, path, False, [],
                           {"error": "unreadable image"}, error="unreadable image")
         data_url, sent_size, orig_size = encoded
+        ref_url = self.reference_url(reference, orig_size)
 
-        body = self.build_body(data_url, view)
+        body = self.build_body(data_url, view, ref_url)
         url = f"{self.cfg.base_url.rstrip('/')}/chat/completions"
         last_err = ""
         for attempt in range(1, self.cfg.max_retries + 1):
@@ -347,8 +395,10 @@ class Labeler:
                     "temperature": body["temperature"],
                     "max_tokens": body["max_tokens"],
                     "response_format": body.get("response_format"),
+                    "reasoning_effort": body.get("reasoning_effort"),
                     "view": view,
                     "image_bytes_b64": len(data_url),
+                    "reference": str(reference) if ref_url else None,
                     "attempt": attempt,
                 }
                 parsed["_elapsed_s"] = round(time.monotonic() - t0, 2)
@@ -359,7 +409,8 @@ class Labeler:
                     elapsed_s=parsed["_elapsed_s"], attempts=attempt,
                     out_of_vocabulary=parsed.get("out_of_vocabulary", []),
                     notes=parsed.get("notes", []),
-                    sent_size=sent_size, orig_size=orig_size)
+                    sent_size=sent_size, orig_size=orig_size,
+                    reference_used=bool(ref_url))
             except Exception as exc:  # network, HTTP, timeout, bad JSON
                 last_err = f"{type(exc).__name__}: {exc}"
                 if attempt < self.cfg.max_retries:
@@ -396,8 +447,13 @@ class Labeler:
 
         obj = _extract_json(text)
         if obj is None:
+            finish = (payload["choices"][0] or {}).get("finish_reason")
+            hint = (" (finish_reason=length: the model ran out of max_tokens, "
+                    "usually while reasoning — set llm.reasoning_effort: none or "
+                    "raise llm.max_tokens)") if finish == "length" else ""
             return {"ok": False, "boxes": [], "error": f"no JSON object in reply: "
-                    f"{text[:200]!r}", "notes": notes, "content": text}
+                    f"{text[:200]!r}{hint}", "notes": notes, "content": text,
+                    "finish_reason": finish}
         # "Pure" = the whole reply parses as one JSON object. Formatting
         # (indentation, key order, spacing) is irrelevant; prose or a fence is not.
         try:
@@ -613,6 +669,8 @@ def main(argv: list[str] | None = None) -> int:
                         help="list what would be sent, send nothing")
     parser.add_argument("--print-response", action="store_true",
                         help="dump the raw reply for each frame (sanity check)")
+    parser.add_argument("--no-reference", action="store_true",
+                        help="do not send the onboard detector's frame as a hint")
     parser.add_argument("--health", action="store_true",
                         help="query /v1/models, report, then exit")
     args = parser.parse_args(argv)
@@ -627,7 +685,7 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     lcfg = LabelerConfig(
-        base_url=(args.base_url or get_dotted(cfg, "llm.base_url")).rstrip("/"),
+        base_url=resolve_llm_base_url(args.base_url or get_dotted(cfg, "llm.base_url")),
         model=args.model or str(get_dotted(cfg, "llm.model", "")),
         api_key=str(get_dotted(cfg, "llm.api_key", "lm-studio")),
         timeout_s=float(get_dotted(cfg, "llm.timeout_s", 180)),
@@ -647,6 +705,11 @@ def main(argv: list[str] | None = None) -> int:
         view_hint=str(get_dotted(cfg, "llm.view_hint", None)
                       or get_dotted(cfg, "mower.front_camera_hint", None)
                       or "a robot mower camera at ground level"),
+        use_reference=not args.no_reference and bool(
+            get_dotted(cfg, "llm.use_reference", False)),
+        reference_prompt=str(get_dotted(cfg, "llm.reference_prompt", "")
+                             or DEFAULT_REFERENCE_PROMPT).strip(),
+        reasoning_effort=str(get_dotted(cfg, "llm.reasoning_effort", "") or ""),
     )
     aliases = build_aliases(names, get_dotted(cfg, "llm.class_aliases", {}) or {})
     labeler = Labeler(lcfg, names, aliases)
@@ -659,6 +722,8 @@ def main(argv: list[str] | None = None) -> int:
         print("  2. load a VISION model (a text-only model will return nothing useful)")
         print("  3. to reach it from another machine, start the server bound to the "
               "LAN\n     and allow the port through the firewall")
+        print("  4. from WSL: either networkingMode=mirrored in %UserProfile%\\.wslconfig,\n"
+              "     or `lms server start --bind 0.0.0.0` on Windows (see setup.sh)")
         return 2
     if args.health:
         return 0
@@ -725,9 +790,13 @@ def main(argv: list[str] | None = None) -> int:
         topic = (rec or {}).get("topic") or ""
         return topic if topic else lcfg.view_hint
 
+    def reference_for(path: Path) -> Path | None:
+        ref = (manifest.get(path.name) or {}).get("reference_path")
+        return resolve(ref) if ref else None
+
     def work(path: Path) -> None:
         nonlocal done_count
-        result = labeler.label_one(path, view_hint_for(path))
+        result = labeler.label_one(path, view_hint_for(path), reference_for(path))
         raw_path = raw_dir / f"{result.stem}.json"
         write_json_atomic(raw_path, {
             "stem": result.stem,
@@ -740,6 +809,7 @@ def main(argv: list[str] | None = None) -> int:
             "orig_width": result.orig_size[0],
             "orig_height": result.orig_size[1],
             "max_edge": lcfg.max_edge,
+            "reference_used": result.reference_used,
             "ok": result.ok,
             "error": result.error,
             "boxes": result.boxes,

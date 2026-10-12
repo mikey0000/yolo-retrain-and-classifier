@@ -1,0 +1,24 @@
+# .venv-export — airockchip ONNX export + rknn-toolkit2 (05). Python 3.11.
+# Built by ./setup.sh --rknn; torch==2.2.0 / torchvision==0.17.0 (CPU) go in first.
+# The airockchip fork itself is put on PYTHONPATH by 05; these are its deps.
+# rknn-toolkit2 itself: setup.sh adds ==<export.rknn.toolkit_version>
+setuptools<70            # rknn-toolkit2 imports pkg_resources
+numpy>=1.23,<=1.26.4
+opencv-python>=4.6,<4.12
+pyyaml>=5.3.1
+requests>=2.23
+pillow>=7.1.2
+matplotlib>=3.3
+scipy>=1.4.1
+tqdm>=4.64
+psutil
+py-cpuinfo
+pandas>=1.1.4
+seaborn>=0.11
+ultralytics-thop>=2.0.0
+# rknn-toolkit2 2.3.0's cp311 wheel only asks for onnx>=1.10, but it uses
+# onnx.mapping, which newer onnx removed (load_onnx: AttributeError).
+onnx==1.16.1
+onnxruntime==1.17.3
+onnxslim==0.1.34          # airockchip export simplify; newer needs newer onnx
+pytest>=8

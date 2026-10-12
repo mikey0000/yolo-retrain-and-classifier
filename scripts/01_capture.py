@@ -28,6 +28,16 @@ Output::
 
     work/frames/<session>/<camera>/<seq>_<stamp_ns>.jpg
     work/frames/<session>/manifest.jsonl     one JSON object per kept frame
+    work/reference/<session>/<camera>/<seq>_<stamp_ns>.jpg   (cameras with `reference:`)
+
+Reference frames: a camera may name a ``reference`` topic, typically the
+onboard detector's annotated image (``/ai/det/image_annotated``). That topic is
+held on one MJPEG connection and its latest frame is saved, under the same
+file name, next to every kept raw frame. The manifest records
+``reference_path`` and ``reference_age_ms``. 02 can show it to the VLM as a hint
+and ``review_sheet.py`` puts it beside the VLM's boxes, so you can see what the
+deployed model got wrong. Reference frames live outside ``frames/`` so no later
+step ever trains on boxes drawn into pixels.
 
 Why the manifest: later steps need to know *which* camera a frame came from, when
 it was captured, and (if you add it) where the mower was. Without it, a dataset
@@ -117,12 +127,14 @@ def _on_signal(signum, _frame) -> None:  # pragma: no cover - signal path
 # source construction
 # ---------------------------------------------------------------------------
 
-def stream_from_config(cfg: dict) -> list[StreamSpec]:
+def stream_from_config(cfg: dict, include_disabled: bool = False) -> list[StreamSpec]:
     """Turn the active profile's camera presets into StreamSpecs.
 
     With ``mower.transport: rtsp`` every camera comes from the profile's
     ``rtsp_url`` template (the mediamtx relay) instead of web_video_server;
     a camera may also carry its own ``rtsp:`` URL to opt in individually.
+    Cameras with ``enabled: false`` are left out unless ``include_disabled``
+    (``--cameras`` names them explicitly).
     """
     cameras = camera_presets(cfg)
     if not cameras:
@@ -141,15 +153,20 @@ def stream_from_config(cfg: dict) -> list[StreamSpec]:
     for name, cam in cameras.items():
         if not isinstance(cam, dict) or "topic" not in cam:
             continue
+        if not include_disabled and cam.get("enabled", True) is False:
+            continue
         mode = str(cam.get("mode", "stream"))
         rate = float(cam.get("rate_hz", 1.0))
         topic = str(cam["topic"])
+        # The reference is always read over HTTP (web_video_server), whatever
+        # transport the camera itself uses.
+        reference = str(cam.get("reference") or "")
         cam_tpl = str(cam.get("rtsp") or "")
         if rtsp_transport == "rtsp" or cam_tpl:
             specs.append(StreamSpec(
                 name=name,
                 url=build_rtsp_url(cam_tpl or tpl, mower_host(cfg), name, topic),
-                mode="rtsp", rate_hz=rate, topic=topic))
+                mode="rtsp", rate_hz=rate, topic=topic, reference=reference))
             continue
         specs.append(StreamSpec(
             name=name,
@@ -158,6 +175,7 @@ def stream_from_config(cfg: dict) -> list[StreamSpec]:
             mode=mode,
             rate_hz=rate,
             topic=topic,
+            reference=reference,
         ))
     return specs
 
@@ -247,7 +265,13 @@ def probe(cfg: dict, specs: list[StreamSpec]) -> int:
     read_to = float(get_dotted(cfg, "mower.read_timeout_s", 30.0))
     rtsp_transport = str(get_dotted(cfg, "capture.rtsp_transport", "tcp"))
     alive = 0
+    refs = []
     for spec in specs:
+        if spec.reference and spec.reference not in {r.topic for r in refs}:
+            refs.append(StreamSpec(
+                name=f"{spec.name}~ref", url=reference_url(cfg, spec.reference),
+                mode="stream", topic=spec.reference))
+    for spec in [*specs, *refs]:
         t0 = time.monotonic()
         try:
             if spec.mode == "stream":
@@ -282,8 +306,63 @@ def probe(cfg: dict, specs: list[StreamSpec]) -> int:
             else:
                 for hint in silent_topic_hint(cfg, spec.topic or "<topic>"):
                     print(f"         -> {hint}")
-    print(f"\n{alive}/{len(specs)} streams returned a frame")
+    print(f"\n{alive}/{len(specs) + len(refs)} streams returned a frame")
     return 0 if alive else 1
+
+
+# ---------------------------------------------------------------------------
+# reference feed (onboard detector output)
+# ---------------------------------------------------------------------------
+
+def reference_url(cfg: dict, topic: str) -> str:
+    return build_stream_url(
+        mower_base_url(cfg),
+        get_dotted(cfg, "mower.stream_path", "/stream?topic={topic}&type=mjpeg"), topic)
+
+
+class ReferenceFeed:
+    """Latest frame of a companion topic, from one held MJPEG connection.
+
+    Holding the stream (instead of a snapshot per kept frame) is what makes the
+    pairing usable: a snapshot waits for the *next* message, so it would land
+    up to a publish period after the raw frame. Reconnects on error until
+    capture stops.
+    """
+
+    def __init__(self, topic: str, url: str, connect_to: float, read_to: float) -> None:
+        self.topic, self.url = topic, url
+        self.connect_to, self.read_to = connect_to, read_to
+        self.frames = 0
+        self.error = ""
+        self._latest: tuple[bytes, float] | None = None
+        self._lock = threading.Lock()
+
+    def start(self) -> None:
+        threading.Thread(target=self._run, name=f"ref-{self.topic}", daemon=True).start()
+
+    def _run(self) -> None:
+        while not _STOP.is_set():
+            try:
+                for payload in iter_mjpeg(self.url, self.connect_to, self.read_to):
+                    with self._lock:
+                        self._latest = (payload, time.monotonic())
+                        self.frames += 1
+                    if _STOP.is_set():
+                        return
+            except Exception as exc:  # silent topic, network
+                if exc.__class__.__name__ != self.error.split(":")[0]:
+                    LOG.warning("reference %s: %s (retrying)", self.topic, exc)
+                self.error = f"{type(exc).__name__}: {exc}"
+            _STOP.wait(2.0)
+
+    def latest(self, max_age_s: float) -> tuple[bytes, float] | None:
+        """``(jpeg, age_s)`` when a frame newer than ``max_age_s`` is held."""
+        with self._lock:
+            if self._latest is None:
+                return None
+            payload, at = self._latest
+        age = time.monotonic() - at
+        return (payload, age) if age <= max_age_s else None
 
 
 # ---------------------------------------------------------------------------
@@ -474,6 +553,16 @@ def run_capture(cfg: dict, specs: list[StreamSpec], out_dir: Path,
     manifest_lock = threading.Lock()
     deadline = time.monotonic() + duration_s if duration_s > 0 else None
 
+    ref_root = cfg_path(cfg, "paths.reference_dir", "work/reference") / session_dir.name
+    ref_max_age = float(get_dotted(cfg, "capture.reference_max_age_s", 2.0))
+    feeds: dict[str, ReferenceFeed] = {}
+    for spec in specs:
+        if spec.reference and spec.reference not in feeds:
+            feeds[spec.reference] = ReferenceFeed(
+                spec.reference, reference_url(cfg, spec.reference), connect_to, read_to)
+            feeds[spec.reference].start()
+            LOG.info("reference %s -> %s", spec.reference, ref_root)
+
     def should_stop(writer: CameraWriter) -> bool:
         if _STOP.is_set() or budget.hit:
             return True
@@ -489,9 +578,28 @@ def run_capture(cfg: dict, specs: list[StreamSpec], out_dir: Path,
 
     def keep(writer: CameraWriter, payload: bytes) -> None:
         rec = writer.write(payload, int(time.time() * 1e9))
-        if rec is not None:
-            with manifest_lock:
-                append_jsonl(manifest, rec)
+        if rec is None:
+            return
+        if writer.spec.reference:
+            add_reference(rec, writer.spec, feeds[writer.spec.reference])
+        with manifest_lock:
+            append_jsonl(manifest, rec)
+
+    def add_reference(rec: dict, spec: StreamSpec, feed: ReferenceFeed) -> None:
+        rec["reference_topic"] = spec.reference
+        got = feed.latest(ref_max_age)
+        if got is None:
+            rec["reference_path"] = None
+            return
+        ref_payload, age = got
+        path = ref_root / spec.name / Path(rec["path"]).name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(path.name + ".tmp")
+        tmp.write_bytes(ref_payload)
+        os.replace(tmp, path)
+        w, h = image_size_bytes(ref_payload)
+        rec.update(reference_path=_display_path(path), reference_age_ms=round(age * 1000),
+                   reference_width=w, reference_height=h)
 
     def stream_loop(spec: StreamSpec) -> None:
         writer = writers[spec.name]
@@ -588,6 +696,9 @@ def run_capture(cfg: dict, specs: list[StreamSpec], out_dir: Path,
         if _STOP.is_set() or budget.hit or (deadline and time.monotonic() > deadline + 1.0):
             break
 
+    for feed in feeds.values():
+        LOG.info("reference %s: %d frame(s) received%s", feed.topic, feed.frames,
+                 f", last error {feed.error}" if feed.error and not feed.frames else "")
     return summarise(cfg, session_dir, manifest, writers)
 
 
@@ -771,7 +882,11 @@ def main(argv: list[str] | None = None) -> int:
                           "needs ffmpeg)")
     src.add_argument("--folder", help="import images from this local folder instead")
     src.add_argument("--cameras", help="comma list of cameras from the config "
-                                       "(default: all of them)")
+                                       "(default: every camera not `enabled: false`)")
+    src.add_argument("--reference", metavar="TOPIC",
+                     help="companion topic saved with every frame, e.g. "
+                          "/ai/det/image_annotated ('' disables; default: the "
+                          "camera's `reference:`)")
 
     parser.add_argument("--out", help="output dir (default: capture.out_dir)")
     parser.add_argument("--session", help="session name (default: timestamp)")
@@ -833,7 +948,7 @@ def main(argv: list[str] | None = None) -> int:
         specs.extend(parse_topic_specs(args.topic, base, tpl,
                                        float(args.rate or 1.0)))
     if not specs:
-        specs = stream_from_config(cfg)
+        specs = stream_from_config(cfg, include_disabled=bool(args.cameras))
         if args.cameras:
             wanted = {c.strip() for c in args.cameras.split(",") if c.strip()}
             specs = [s for s in specs if s.name in wanted]
@@ -852,6 +967,8 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.rate is not None:
         specs = [dataclasses.replace(spec, rate_hz=args.rate) for spec in specs]
+    if args.reference is not None:
+        specs = [dataclasses.replace(spec, reference=args.reference) for spec in specs]
     if args.snapshot:
         specs = [as_snapshot(cfg, spec) for spec in specs]
 

@@ -197,6 +197,12 @@ DEVICE_MODE="${DEVICE:-$(cfg train.device auto)}"
 AMP_MODE="${AMP:-$(cfg train.amp auto)}"
 
 export HSA_OVERRIDE_GFX_VERSION="${HSA_OVERRIDE_GFX_VERSION:-11.0.0}"
+# WSL: ROCm < 7.13 only uses librocdxg (/dev/dxg) when this is set; without it
+# hsa_init fails and torch silently falls back to the CPU. Harmless elsewhere.
+export HSA_ENABLE_DXG_DETECTION="${HSA_ENABLE_DXG_DETECTION:-1}"
+# RX 7900 XTX: torch's default hipBLASLt path runs fp32 GEMMs at ~1.3 TFLOPS on
+# gfx1100; rocBLAS does ~21. Training here is fp32 (AMP off on ROCm).
+export TORCH_BLAS_PREFER_HIPBLASLT="${TORCH_BLAS_PREFER_HIPBLASLT:-0}"
 export PYTORCH_HIP_ALLOC_CONF="${PYTORCH_HIP_ALLOC_CONF:-expandable_segments:True}"
 
 echo "=== environment ==="
@@ -256,6 +262,9 @@ PATIENCE="${PATIENCE:-$(cfg train.patience 25)}"
 BATCH="${BATCH:-$(cfg train.batch 32)}"
 WORKERS="${WORKERS:-$(cfg train.workers 8)}"
 PROJECT="${PROJECT:-$(cfg train.project runs)}"
+# Absolute: ultralytics >= 8.3 puts a relative project under its own
+# runs_dir/<task>/ (runs/detect/runs/...), where nothing below would find it.
+[[ "$PROJECT" = /* ]] || PROJECT="$REPO_ROOT/$PROJECT"
 NAME="${NAME:-$(cfg train.name det_22cls)}"
 CACHE="${CACHE:-$(cfg train.cache false)}"
 AMP_ARG=""

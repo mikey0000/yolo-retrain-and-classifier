@@ -3,22 +3,32 @@
 #
 #   ./setup.sh                 venv + everything for 01..04 + airockchip fork
 #   ./setup.sh --minimal       runtime only (01-03): pyyaml, requests, pillow
-#   ./setup.sh --rknn          also install rknn-toolkit2 (05; x86_64 only)
+#   ./setup.sh --rknn          also build .venv-export for 05 (rknn-toolkit2; x86_64 only)
+#   ./setup.sh --rocm          install ROCm for WSL (sudo, once) + AMD's ROCm torch,
+#                              so 04 trains on an AMD GPU (tested: RX 7900 XTX)
 #   ./setup.sh --check         report what is installed, change nothing
 #   ./setup.sh --help          all options
 #
 # It uses uv when uv is on your PATH (interpreter + installs), and falls back
 # to python3 -m venv + pip when it is not. Idempotent: run it again after a
-# git pull. Everything it installs lives in .venv/ (gitignored) and
-# ../ultralytics_yolov8 (a sibling checkout, per config/pipeline.yaml
-# export.airockchip_repo).
+# git pull. Everything it installs lives in .venv/ and .venv-export/
+# (gitignored) and ../ultralytics_yolov8 (a sibling checkout, per
+# config/pipeline.yaml export.airockchip_repo).
+#
+# Why two venvs: rknn-toolkit2 2.3.0 needs torch <= 2.4, numpy <= 1.26 and an
+# onnx that still has onnx.mapping. Installed into .venv it downgrades the
+# training torch (and replaces a ROCm build with a CPU one). 05 uses
+# .venv-export when it exists.
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$REPO_ROOT"
+# uv's installer puts it here; non-login shells often lack it on PATH.
+export PATH="$HOME/.local/bin:$PATH"
 
 MINIMAL=0
 WANT_RKNN=0
+WANT_ROCM=0
 WANT_FORK=1
 WANT_TESTS=1
 CHECK_ONLY=0
@@ -32,8 +42,13 @@ usage() {
 
 Options:
   --minimal        only pyyaml/requests/pillow (01-03); no torch, no fork
-  --rknn           also install rknn-toolkit2==<export.rknn.toolkit_version>
-                   (the .rknn compiler; x86_64 Linux only, including x86 WSL)
+  --rknn           also build .venv-export: python 3.11 (via uv), CPU torch 2.2,
+                   rknn-toolkit2==<export.rknn.toolkit_version> and the
+                   airockchip fork's deps (requirements-export.txt). The .rknn
+                   compiler is x86_64 Linux only, including x86 WSL
+  --rocm           install ROCm 7.2.4 (needs sudo, once): on WSL via
+                   amdgpu-install --usecase=wsl,rocm; then AMD's ROCm torch
+                   wheels into .venv. Re-running without --rocm keeps them
   --no-fork        do not clone airockchip/ultralytics_yolov8 (05 export)
   --no-tests       do not run tests/ at the end
   --fork-dir DIR   where to clone the airockchip fork
@@ -55,6 +70,7 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --minimal)   MINIMAL=1; shift ;;
     --rknn)      WANT_RKNN=1; shift ;;
+    --rocm)      WANT_ROCM=1; shift ;;
     --no-fork)   WANT_FORK=0; shift ;;
     --no-tests)  WANT_TESTS=0; shift ;;
     --fork-dir)  FORK_DIR="$2"; shift 2 ;;
@@ -75,6 +91,81 @@ if [[ -n "${WSL_DISTRO_NAME:-}${WSL_INTEROP:-}" ]] || \
   IS_WSL=1
 fi
 ARCH="$(uname -m)"
+
+# --- ROCm (AMD GPU training) -------------------------------------------------
+ROCM_VERSION="7.2.4"
+ROCM_DEB="amdgpu-install_7.2.4.70204-1_all.deb"
+ROCM_WHEELS="https://repo.radeon.com/rocm/manylinux/rocm-rel-${ROCM_VERSION}"
+# AMD's tested set for ROCm 7.2.x on Radeon (cp312 only).
+ROCM_TORCH=(
+  "${ROCM_WHEELS}/torch-2.9.1%2Brocm7.2.4.lw.git39497456-cp312-cp312-linux_x86_64.whl"
+  "${ROCM_WHEELS}/torchvision-0.24.0%2Brocm7.2.4.gitb919bd0c-cp312-cp312-linux_x86_64.whl"
+  "${ROCM_WHEELS}/triton-3.5.1%2Brocm7.2.4.gita272dfa8-cp312-cp312-linux_x86_64.whl"
+)
+# ROCm < 7.13 on WSL only routes through librocdxg (/dev/dxg) when asked;
+# without it hsa_init fails and torch silently runs on the CPU.
+[[ $IS_WSL -eq 1 ]] && export HSA_ENABLE_DXG_DETECTION=1
+
+# On WSL, rocdxg-roct installs librocdxg into a real /opt/rocm directory, so
+# the usual /opt/rocm -> /opt/rocm-X symlink is never created: look in both.
+rocm_root() {
+  local d
+  for d in "/opt/rocm-${ROCM_VERSION}" /opt/rocm; do
+    [[ -e "$d/lib/libhsa-runtime64.so.1" ]] && { echo "$d"; return 0; }
+  done
+  return 1
+}
+
+install_rocm() {
+  echo
+  echo "=== ROCm ${ROCM_VERSION} (sudo) ==="
+  if rocm_root >/dev/null; then
+    echo "already installed: $(rocm_root)"
+  else
+    command -v apt-get >/dev/null 2>&1 || die "--rocm is implemented for Ubuntu (apt) only"
+    local args=(--usecase=rocm --no-dkms)
+    if [[ $IS_WSL -eq 1 ]]; then
+      [[ -e /dev/dxg ]] || die "/dev/dxg missing: this WSL has no GPU paravirtualisation.
+  Update WSL (wsl --update) and the AMD Adrenalin driver on Windows."
+      args=(--usecase=wsl,rocm --no-dkms)
+    fi
+    local tmp; tmp="$(mktemp -d)"
+    wget -q -O "$tmp/$ROCM_DEB" \
+      "https://repo.radeon.com/amdgpu-install/${ROCM_VERSION}/ubuntu/$(. /etc/os-release; echo "$VERSION_CODENAME")/${ROCM_DEB}"
+    sudo apt-get update
+    sudo apt-get install -y "$tmp/$ROCM_DEB"
+    sudo amdgpu-install -y "${args[@]}"
+    rm -rf "$tmp"
+    rocm_root >/dev/null || die "amdgpu-install finished but no libhsa-runtime64 under /opt/rocm*"
+  fi
+  sudo usermod -aG video,render "$USER" || true
+  "$(rocm_root)/bin/rocminfo" 2>/dev/null | grep -m1 -E "Marketing Name:.*(Radeon|Instinct)" \
+    || echo "WARNING: rocminfo does not list an AMD GPU (Windows driver too old? see README)"
+}
+
+# AMD's ROCm torch into .venv, wired to the system HSA runtime.
+install_rocm_torch() {
+  local root; root="$(rocm_root)" || return 1
+  [[ "$(py_version "$VENV_PY" | cut -d. -f1,2)" == "3.12" ]] || die "AMD's ROCm torch wheels are cp312; .venv is python $(py_version "$VENV_PY").
+  rm -rf .venv && PYTHON=3.12 ./setup.sh --rocm"
+  if ! "$VENV_PY" -c "import torch,sys; sys.exit(0 if torch.version.hip else 1)" 2>/dev/null; then
+    pip_install "${ROCM_TORCH[@]}"
+  fi
+  # torch must use the system HSA runtime (the one that loads librocdxg on
+  # WSL), not the copy bundled in the wheel. Symlinked rather than deleted:
+  # Ubuntu's libamdhip64-5 ships an old libhsa-runtime64.so.1 in /usr/lib.
+  local tlib; tlib="$("$VENV_PY" -c 'import torch,os; print(os.path.join(os.path.dirname(torch.__file__),"lib"))')"
+  rm -f "$tlib"/libhsa-runtime64.so*
+  ln -s "$root/lib/libhsa-runtime64.so.1" "$tlib/libhsa-runtime64.so.1"
+  ln -s "$root/lib/libhsa-runtime64.so.1" "$tlib/libhsa-runtime64.so"
+  # For `source .venv/bin/activate` users; 04_train.sh sets both itself.
+  local act="$REPO_ROOT/.venv/bin/activate"
+  grep -q HSA_ENABLE_DXG_DETECTION "$act" || [[ $IS_WSL -eq 0 ]] || \
+    echo 'export HSA_ENABLE_DXG_DETECTION=1  # ROCm on WSL (librocdxg); added by setup.sh' >> "$act"
+  grep -q TORCH_BLAS_PREFER_HIPBLASLT "$act" || \
+    echo 'export TORCH_BLAS_PREFER_HIPBLASLT=0  # fp32 GEMM via rocBLAS (hipBLASLt ~15x slower on gfx1100); added by setup.sh' >> "$act"
+  return 0
+}
 
 py_version() { "$1" -c 'import sys; print("%d.%d.%d" % sys.version_info[:3])' 2>/dev/null || true; }
 py_at_least() {  # py_at_least <exe> <major> <minor>
@@ -147,7 +238,33 @@ run_check() {
   check_mod pillow     pillow     1
   check_mod ultralytics ultralytics "$([[ $MINIMAL -eq 1 ]] && echo 0 || echo 1)"
   check_mod pytest     pytest     0
-  check_mod rknn-toolkit2 rknn-toolkit2 0
+  if [[ -x "$REPO_ROOT/.venv-export/bin/python" ]]; then
+    printf '  %-13s %-14s %s\n' "rknn-toolkit2" \
+      "$("$REPO_ROOT/.venv-export/bin/python" -c "import importlib.metadata as m; print(m.version('rknn-toolkit2'))" 2>/dev/null || echo '?')" \
+      "OK  (.venv-export)"
+  else
+    printf '  %-13s %-14s %s\n' "rknn-toolkit2" "-" "not installed (05; ./setup.sh --rknn)"
+  fi
+
+  # The labeller's endpoint (llm.base_url: auto tries localhost, then the
+  # Windows host through WSL NAT).
+  local llm
+  llm="$("$VENV_PY" - <<'PY' 2>/dev/null || true
+import sys; sys.path.insert(0, "scripts")
+import requests
+from common import get_dotted, load_config, resolve_llm_base_url
+url = resolve_llm_base_url(get_dotted(load_config(), "llm.base_url"))
+try:
+    n = len(requests.get(url + "/models", timeout=3).json().get("data", []))
+    print(f"{url}  OK ({n} models)")
+except Exception:
+    print(f"{url}  UNREACHABLE")
+PY
+)"
+  printf '  %-13s %s\n' "llm" "${llm:-?}"
+  if [[ "$llm" == *UNREACHABLE* && $IS_WSL -eq 1 ]]; then
+    echo "                LM Studio on Windows binds 127.0.0.1 by default; see the WSL notes (./setup.sh)"
+  fi
 
   # ffmpeg is a system package, not a pip one: RTSP capture (01 --rtsp /
   # mower.transport: rtsp) and video-frame extraction both shell out to it.
@@ -165,6 +282,9 @@ run_check() {
     local backend
     backend="$("$VENV_PY" "$REPO_ROOT/scripts/_backend.py" 2>/dev/null | tail -n1 || true)"
     printf '  %-13s %s\n' "torch" "${backend#backend=}"
+    if [[ "$backend" == backend=cpu ]] && rocm_root >/dev/null; then
+      echo "                ROCm is installed but torch is a CPU build -> ./setup.sh --rocm"
+    fi
   else
     printf '  %-13s %s\n' "torch" "not installed (needed for 04/05)"
   fi
@@ -327,9 +447,25 @@ if [[ "$PIP_MODE" == pip ]]; then pip_install --upgrade pip; fi
 pip_install -r requirements.txt
 echo "runtime     : pyyaml, requests, pillow"
 
+if [[ "$WANT_ROCM" -eq 1 ]]; then
+  install_rocm
+fi
+
 if [[ "$MINIMAL" -eq 0 ]]; then
-  pip_install ultralytics pytest
-  echo "training    : ultralytics (pulls torch), pytest"
+  # torch first, so ultralytics does not pull a default (CUDA) build:
+  #   ROCm installed -> AMD's ROCm wheels; NVIDIA -> PyPI default; else CPU.
+  if rocm_root >/dev/null && [[ "$ARCH" == x86_64 ]]; then
+    install_rocm_torch
+    # AMD's wheels are built against numpy 1.x; opencv>=4.12 needs numpy 2.
+    pip_install ultralytics pytest "numpy<2" "opencv-python<4.12"
+    echo "training    : ultralytics, pytest, torch $("$VENV_PY" -c 'import torch; print(torch.__version__)') (ROCm)"
+  else
+    if ! "$VENV_PY" -c "import torch" 2>/dev/null && ! command -v nvidia-smi >/dev/null 2>&1; then
+      pip_install --index-url https://download.pytorch.org/whl/cpu torch torchvision
+    fi
+    pip_install ultralytics pytest
+    echo "training    : ultralytics, pytest, torch $("$VENV_PY" -c 'import torch; print(torch.__version__)')"
+  fi
 fi
 
 if [[ "$WANT_RKNN" -eq 1 ]]; then
@@ -338,17 +474,18 @@ if [[ "$WANT_RKNN" -eq 1 ]]; then
   Build the .onnx here (05 --skip-rknn) and convert on an x86_64 Linux host
   or x86 WSL; see README 'Conversion: x86_64 only'."
   fi
+  [[ $HAS_UV -eq 1 ]] || die "--rknn builds .venv-export on python 3.11, which needs uv
+  (https://docs.astral.sh/uv/: curl -LsSf https://astral.sh/uv/install.sh | sh)."
   TK_VER="$(cfg_get export.rknn.toolkit_version 2.3.0)"
-  pip_install --force-reinstall "rknn-toolkit2==$TK_VER" || die "could not install rknn-toolkit2==$TK_VER (05 can retry with --reinstall-toolkit).
-  Most often the venv's python is newer than the wheels Rockchip publishes
-  (they stop at cp312); this venv is python $(py_version "$VENV_PY").
-    with uv:    rm -rf .venv && PYTHON=3.12 ./setup.sh --rknn     (uv fetches 3.12)
-    without uv: install python3.12 + python3.12-venv, then
-                rm -rf .venv && PYTHON=python3.12 ./setup.sh --rknn
-  Or leave this venv alone and convert on an x86_64 host that has the toolkit:
-                bash scripts/05_export_rknn.sh --skip-rknn    (export here)
-                bash scripts/05_export_rknn.sh --onnx-in ...   (convert there)"
-  echo "conversion  : rknn-toolkit2 $TK_VER"
+  EXPORT_PY="$REPO_ROOT/.venv-export/bin/python"
+  [[ -x "$EXPORT_PY" ]] || uv venv -q --python 3.11 "$REPO_ROOT/.venv-export"
+  # The CPU index only: with PyPI as an extra index uv picks the CUDA build.
+  "$EXPORT_PY" -c "import torch" 2>/dev/null || \
+    uv pip install -q --python "$EXPORT_PY" --index-url https://download.pytorch.org/whl/cpu \
+      "torch==2.2.0" "torchvision==0.17.0"
+  uv pip install -q --python "$EXPORT_PY" -r requirements-export.txt "rknn-toolkit2==$TK_VER" \
+    || die "could not install rknn-toolkit2==$TK_VER into .venv-export"
+  echo "conversion  : rknn-toolkit2 $TK_VER in .venv-export (python $(py_version "$EXPORT_PY"))"
 fi
 
 # ---------------------------------------------------------------------------
@@ -414,11 +551,14 @@ if [[ $IS_WSL -eq 1 ]]; then
     /mnt/c is much slower for pip/torch and does not support hardlinks, so
     03's dataset assembly degrades to full copies.
   - GPU: NVIDIA works in WSL2 using the Windows driver (do NOT install a
-    Linux NVIDIA driver inside WSL). AMD ROCm does not work under WSL, so 04
-    falls back to CPU there — train on native Linux for a real run.
+    Linux NVIDIA driver inside WSL). AMD works through ROCm for WSL:
+    ./setup.sh --rocm (tested: RX 7900 XTX, ROCm 7.2.4, Ubuntu 24.04). It
+    needs HSA_ENABLE_DXG_DETECTION=1, which 04_train.sh and .venv/bin/activate
+    set; check with  ./setup.sh --check  -> torch: rocm.
   - LM Studio on Windows binds 127.0.0.1, which WSL2's NAT cannot reach.
     Either enable mirrored networking (Windows 11: .wslconfig ->
     networkingMode=mirrored, then 127.0.0.1:1234 works as-is) or bind LM
-    Studio to 0.0.0.0 and point llm.base_url at the Windows host IP.
+    Studio to 0.0.0.0 (lms server start --bind 0.0.0.0). llm.base_url: auto
+    finds either.
 WSL
 fi

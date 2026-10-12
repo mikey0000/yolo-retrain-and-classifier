@@ -167,10 +167,13 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-# Prefer the repo's own venv so 05 works without `source .venv/bin/activate`
-# first; PYTHON in the environment still wins.
+# Prefer the repo's own venvs so 05 works without activating one first:
+# .venv-export (CPU torch 2.2 + rknn-toolkit2 2.3.0, which cannot share a venv
+# with the training torch), then .venv. PYTHON in the environment still wins.
 if [[ -z "${PYTHON:-}" ]]; then
-  if [[ -x "$REPO_ROOT/.venv/bin/python" ]]; then
+  if [[ -x "$REPO_ROOT/.venv-export/bin/python" ]]; then
+    PYTHON="$REPO_ROOT/.venv-export/bin/python"
+  elif [[ -x "$REPO_ROOT/.venv/bin/python" ]]; then
     PYTHON="$REPO_ROOT/.venv/bin/python"
   else
     PYTHON=python3

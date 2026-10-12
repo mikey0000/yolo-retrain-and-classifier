@@ -20,13 +20,16 @@ def test_profile_ports_and_explicit_base_url(common, cfg):
     assert common.mower_base_url(cfg) == "http://10.0.0.5:9000"
 
 
-def test_profiles_put_oa_cameras_first_and_hints_differ(common, cfg):
-    for prof in ("ros1", "ros2"):
-        cfg["mower"]["profile"] = prof
-        cams = common.camera_presets(cfg)
-        assert list(cams)[:2] == ["left_oa", "right_oa"]
+def test_profiles_default_cameras_and_hints_differ(common, capture, cfg):
+    cfg["mower"]["profile"] = "ros1"
+    assert list(common.camera_presets(cfg))[:2] == ["left_oa", "right_oa"]
     cfg["mower"]["profile"] = "ros2"
-    assert "/vio/right/image_raw" not in {c["topic"] for c in common.camera_presets(cfg).values()}
+    # ROS 2: only the vio right eye by default, paired with the onboard detector.
+    specs = capture.stream_from_config(cfg)
+    assert [(s.name, s.topic, s.reference) for s in specs] == [
+        ("front", "/vio/right/image_raw", "/ai/det/image_annotated")]
+    every = {s.name for s in capture.stream_from_config(cfg, include_disabled=True)}
+    assert {"front", "left_oa", "right_oa", "rear"} <= every
     assert any("web_video_server:=true" in h for h in common.silent_topic_hint(cfg))
     cfg["mower"]["profile"] = "ros1"
     hints = common.silent_topic_hint(cfg, "/rear_camera/image_raw")
@@ -107,8 +110,8 @@ def _stub_ffmpeg(tmp_path, monkeypatch, script: str) -> None:
 def test_transport_rtsp_builds_profile_urls(cfg, capture):
     cfg["mower"]["profile"] = "ros2"
     cfg["mower"]["transport"] = "rtsp"
-    specs = {s.name: s for s in capture.stream_from_config(cfg)}
-    assert set(specs) == {"left_oa", "right_oa", "rear"}
+    specs = {s.name: s for s in capture.stream_from_config(cfg, include_disabled=True)}
+    assert set(specs) == {"front", "left_oa", "right_oa", "rear"}
     assert all(s.mode == "rtsp" for s in specs.values())
     assert specs["left_oa"].url == "rtsp://192.168.1.105:8554/left_oa"
     assert specs["left_oa"].rate_hz == 1.0          # keep rate survives the switch
@@ -126,7 +129,7 @@ def test_a_camera_may_opt_into_rtsp_individually(cfg, capture):
     cfg["mower"]["profile"] = "ros2"
     cfg["mower"]["transport"] = "http"
     cfg["profiles"]["ros2"]["cameras"]["rear"]["rtsp"] = "rtsp://{host}:8554/{name}"
-    specs = {s.name: s for s in capture.stream_from_config(cfg)}
+    specs = {s.name: s for s in capture.stream_from_config(cfg, include_disabled=True)}
     assert specs["rear"].mode == "rtsp"
     assert specs["rear"].url == "rtsp://192.168.1.105:8554/rear"
     assert specs["left_oa"].mode == "stream"        # the rest stay on HTTP
@@ -219,3 +222,10 @@ def test_folder_import_without_videos_ignores_them(capture, cfg, tmp_path):
     cfg["capture"]["folder"]["videos"] = False
     result = capture.run_folder_capture(cfg, folder, tmp_path / "out", 5.0, 0)
     assert result == {"kept": 0, "errors": 1}   # explains itself in the log
+
+
+def test_llm_base_url_auto_falls_back_to_first_candidate(common, monkeypatch):
+    monkeypatch.setenv("LLM_BASE_URL", "http://127.0.0.1:9/v1/")
+    assert common.llm_base_url_candidates() == ["http://127.0.0.1:9/v1"]
+    assert common.resolve_llm_base_url("auto", timeout_s=0.2) == "http://127.0.0.1:9/v1"
+    assert common.resolve_llm_base_url("http://x:1/v1/") == "http://x:1/v1"

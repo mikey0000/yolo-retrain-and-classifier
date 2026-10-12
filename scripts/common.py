@@ -369,6 +369,57 @@ def silent_topic_hint(cfg: dict, topic: str = "<topic>") -> list[str]:
 
 
 # ---------------------------------------------------------------------------
+# LLM endpoint
+# ---------------------------------------------------------------------------
+
+def wsl_host_ip() -> str | None:
+    """The Windows host as seen from WSL2 NAT networking (the default gateway)."""
+    try:
+        with open("/proc/net/route", encoding="ascii") as fh:
+            for line in fh.readlines()[1:]:
+                fields = line.split()
+                if len(fields) > 2 and fields[1] == "00000000":
+                    raw = int(fields[2], 16)
+                    return ".".join(str((raw >> s) & 0xFF) for s in (0, 8, 16, 24))
+    except OSError:
+        pass
+    return None
+
+
+def llm_base_url_candidates(port: int = 1234) -> list[str]:
+    """Where an OpenAI-compatible server on this machine (or the WSL host) may be.
+
+    ``LLM_BASE_URL`` wins. Then localhost (native Linux, or WSL with
+    ``networkingMode=mirrored``), then the Windows host through WSL NAT (LM
+    Studio started with ``--bind 0.0.0.0``). The gateway is re-read every run
+    because WSL NAT hands out a new subnet after a reboot.
+    """
+    env = os.environ.get("LLM_BASE_URL")
+    if env:
+        return [env.rstrip("/")]
+    out = [f"http://127.0.0.1:{port}/v1"]
+    host = wsl_host_ip()
+    if host:
+        out.append(f"http://{host}:{port}/v1")
+    return out
+
+
+def resolve_llm_base_url(configured: str | None, timeout_s: float = 2.0) -> str:
+    """``llm.base_url`` as configured, or the first answering candidate for ``auto``."""
+    if configured and str(configured).strip().lower() != "auto":
+        return str(configured).rstrip("/")
+    candidates = llm_base_url_candidates()
+    for url in candidates:
+        try:
+            if requests.get(f"{url}/models", timeout=timeout_s).ok:
+                LOG.debug("llm.base_url auto -> %s", url)
+                return url
+        except requests.RequestException:
+            continue
+    return candidates[0]
+
+
+# ---------------------------------------------------------------------------
 # MJPEG over HTTP
 # ---------------------------------------------------------------------------
 
@@ -381,6 +432,9 @@ class StreamSpec:
                                # | "rtsp" (ffmpeg pulls the RTSP URL)
     rate_hz: float = 1.0
     topic: str = ""
+    # Optional companion topic (e.g. the onboard detector's annotated image)
+    # saved alongside every kept frame, for correction and validation.
+    reference: str = ""
 
 
 def build_stream_url(base_url: str, template: str, topic: str) -> str:

@@ -107,7 +107,8 @@ way (05).
 git clone <this repo> airseekers-yolo-retrain
 cd airseekers-yolo-retrain
 ./setup.sh                      # .venv + deps + airockchip fork + tests
-source .venv/bin/activate       # once per shell
+./setup.sh --rknn               # + .venv-export for 05 (rknn-toolkit2)
+source .venv/bin/activate       # once per shell (04/05 find their venv themselves)
 ```
 
 `setup.sh` is idempotent — re-run it after a `git pull` and it tops up whatever
@@ -115,39 +116,60 @@ is missing. When `uv` is on your PATH it builds the venv and installs with uv;
 otherwise it falls back to `python3 -m venv` + pip. Options:
 
 ```bash
-./setup.sh --check      # diagnose an existing install, change nothing
+./setup.sh --check      # deps, fork, torch backend, LM Studio, tests; change nothing
 ./setup.sh --minimal    # runtime only (01-03): no torch, no fork
-./setup.sh --rknn       # also rknn-toolkit2==2.3.0 for 05 (x86_64, python <= 3.12)
+./setup.sh --rknn       # also .venv-export: rknn-toolkit2==2.3.0 for 05 (x86_64; needs uv)
+./setup.sh --rocm       # once: ROCm 7.2.4 (sudo) + AMD's ROCm torch, so 04 trains on an AMD GPU
 ./setup.sh --help
 ```
+
+Two virtualenvs, because the two halves of the pipeline cannot share a torch:
+
+| | Python | torch | used by |
+|---|---|---|---|
+| `.venv` | 3.10+ (3.12 for ROCm) | AMD ROCm 7.2.4 build (2.9.1) when ROCm is installed, the default build with NVIDIA, else CPU | 01–03, `review_sheet.py`, 04 |
+| `.venv-export` | 3.11 (uv) | 2.2.0 CPU | 05 — rknn-toolkit2 2.3.0 needs torch ≤ 2.4, numpy ≤ 1.26 and an onnx that still has `onnx.mapping`; installed into `.venv` it would downgrade the training torch |
+
+`04_train.sh` uses `.venv`; `05_export_rknn.sh` uses `.venv-export`, else
+`.venv` (override either with `PYTHON=...`). The export pins live in
+`requirements-export.txt`.
 
 Then edit `config/pipeline.yaml`. The values you must check before anything
 works:
 
 ```yaml
 mower:
-  profile: ros1            # ros1 = vendor firmware (8181) | ros2 = the ROS 2 port (8080)
+  profile: ros2            # ros1 = vendor firmware (8181) | ros2 = the ROS 2 port (8080)
   host: 192.168.1.105
   base_url: null           # null -> http://<host>:<profile port>; set to override
+llm:
+  base_url: auto           # localhost, then the Windows host when run in WSL
+  model: qwen/qwen3.6-27b  # a vision model loaded in LM Studio (`lms ls`)
 ```
+
+The default ROS 2 capture camera is `front` = `/vio/right/image_raw`, paired
+with the onboard detector's `/ai/det/image_annotated` (see 01, "Reference
+frames"). The other cameras are `enabled: false` and captured with
+`--cameras left_oa,right_oa,...`. The topic list is at
+`http://<mower>:8080/`.
 
 Every value can also be overridden per run without editing the file:
 
 ```bash
-python3 scripts/01_capture.py --set capture.duration_s=30 --set mower.base_url=http://10.0.0.5:8181
+python3 scripts/01_capture.py --set capture.duration_s=30 --set mower.base_url=http://10.0.0.5:8080
 ```
 
 Confirm the install and the mower in one go:
 
 ```bash
-./setup.sh --check                      # deps, fork, torch backend, tests
+./setup.sh --check                      # deps, fork, torch backend, LM Studio, tests
 python3 scripts/01_capture.py --probe   # is the mower answering?
 ```
 
 ### Windows: run it in WSL
 
 This is plain Python + bash, so WSL 2 *is* the supported Windows story. Install
-it (`wsl --install -d Ubuntu` in PowerShell), then run the four commands above
+it (`wsl --install -d Ubuntu` in PowerShell), then run the commands above
 inside the distro. Five things worth knowing first:
 
 1. **Clone into the Linux filesystem** — `~/git/airseekers-yolo-retrain`, not
@@ -157,14 +179,31 @@ inside the distro. Five things worth knowing first:
    WSL `git`, not Windows git (line endings, exec bits).
 2. **GPU.** NVIDIA works in WSL2 through the Windows driver — do **not**
    install a Linux NVIDIA driver inside WSL; a CUDA wheel of torch is enough.
-   AMD ROCm does not work under WSL, so `04_train.sh` falls back to CPU there.
-   `./setup.sh --check` prints the backend torch reports.
+   **AMD works through ROCm for WSL**: `./setup.sh --rocm` (tested: RX 7900
+   XTX, ROCm 7.2.4, Ubuntu 24.04, current Adrenalin driver). It runs
+   `amdgpu-install --usecase=wsl,rocm --no-dkms`, installs AMD's ROCm torch
+   wheels from repo.radeon.com and links torch to the system HSA runtime (the
+   one that loads librocdxg and talks to `/dev/dxg`). Two environment
+   variables matter, both set by `04_train.sh` and appended to
+   `.venv/bin/activate`:
+   - `HSA_ENABLE_DXG_DETECTION=1` — ROCm < 7.13 only uses librocdxg, the WSL
+     bridge, when set. Without it `rocminfo` says `hsa_init Failed` and torch
+     silently runs on the CPU.
+   - `TORCH_BLAS_PREFER_HIPBLASLT=0` — hipBLASLt runs fp32 GEMMs at ~1.3
+     TFLOPS on gfx1100, rocBLAS at ~21. Training here is fp32 (AMP off on ROCm).
+
+   ROCm lands in `/opt/rocm-7.2.4`: the `rocdxg-roct` package makes `/opt/rocm`
+   a plain directory, so the usual symlink is missing (setup.sh looks in both).
+   `./setup.sh --check` prints the backend torch reports (`rocm`). LM Studio
+   and training share the card's VRAM: unload the VLM before a long run.
 3. **LM Studio runs on Windows, WSL2 sits behind NAT**, so an LM Studio server
    bound to `127.0.0.1` is unreachable from inside WSL. Either enable mirrored
-   networking (Windows 11: `%USERPROFILE%\.wslconfig` → `networkingMode=mirrored`
-   — then `http://127.0.0.1:1234/v1` works unchanged) or bind LM Studio to
-   `0.0.0.0` and point `llm.base_url` at the Windows host IP (the
-   `nameserver` in `/etc/resolv.conf`).
+   networking (Windows 11: `%USERPROFILE%\.wslconfig` → `networkingMode=mirrored`,
+   then `wsl --shutdown` — nothing is exposed to the LAN) or bind LM Studio to
+   `0.0.0.0` (`lms server start --bind 0.0.0.0`, persisted; also reachable from
+   the LAN). `llm.base_url: auto` tries `$LLM_BASE_URL`, then `127.0.0.1:1234`,
+   then the Windows host (the WSL default gateway, re-read every run because
+   it changes after a reboot).
 4. **The mower needs nothing special.** It is a plain LAN server (HTTP on
    8181/8080, RTSP on 8554) and WSL2 reaches it like any other host.
    `python3 scripts/01_capture.py --probe` is the check. RTSP capture needs
@@ -205,16 +244,17 @@ files (optional, but install it unless you only ever capture over HTTP):
 sudo apt install ffmpeg        # `./setup.sh --check` reports it
 ```
 
-For the `.rknn` conversion step, on an **x86_64** host (x86 WSL counts):
+For the `.rknn` conversion step, on an **x86_64** host (x86 WSL counts), in
+its own venv:
 
 ```bash
-pip install rknn-toolkit2==2.3.0            # the version the shipped models used
+uv venv --python 3.11 .venv-export
+uv pip install --python .venv-export/bin/python \
+    --index-url https://download.pytorch.org/whl/cpu torch==2.2.0 torchvision==0.17.0
+uv pip install --python .venv-export/bin/python -r requirements-export.txt rknn-toolkit2==2.3.0
 ```
 
-Python **3.10 or newer** is required. `rknn-toolkit2` is the exception: its
-wheels stop at Python **3.12**, so the 05 conversion step needs a 3.12 venv
-(`./setup.sh --rknn` switches to a uv-managed 3.12 by itself when uv is
-available).
+Python **3.10 or newer** is required for `.venv`.
 
 Run the unit tests (no GPU, no network, no mower):
 
@@ -356,6 +396,15 @@ came from (03 records it in provenance, 05 stratifies calibration by it):
 01 does not record the mower's pose. If you add an `odom: [x, y]` field to the
 manifest yourself, 03 can split by pose cell (see 03).
 
+**Reference frames (onboard detector).** A camera with `reference: <topic>`
+(on `front`: `/ai/det/image_annotated`) holds that topic on one MJPEG
+connection and, for every kept raw frame, saves the latest reference frame
+(≤ `capture.reference_max_age_s` old) to
+`work/reference/<session>/<camera>/<same name>.jpg`. The manifest gets
+`reference_path`, `reference_age_ms`, `reference_width/height`. They live
+outside `frames/` so nothing trains on boxes drawn into pixels. `--reference ''`
+turns it off; `--reference <topic>` sets it for `--topic` sources.
+
 **Notes**
 
 - **Don't leave the rear camera streaming while docked** on the vendor
@@ -443,6 +492,28 @@ Why these choices:
   positives invents obstacles in clean grass.
 - If the server rejects `response_format` with HTTP 400, 02 retries without it
   and, once that works, stops sending it for the rest of the run.
+
+- **The onboard detector as a hint** (`llm.use_reference: true`). When 01
+  saved a reference frame, it goes along as a second image with a prompt that
+  says it is fallible and that boxes refer to the first image. Not sent when
+  its aspect ratio differs from the raw frame's (a different camera = a
+  different scene); `reference_used` in the raw JSON records which happened.
+  `--no-reference` for a run without it.
+- **`reasoning_effort: none`.** Qwen 3.x / Gemma 4 otherwise think for
+  hundreds of tokens per frame and can run out of `max_tokens` before the
+  JSON (an empty reply, `finish_reason=length`).
+
+**Look at it before 03:**
+
+```bash
+python scripts/review_sheet.py --images work/frames/<session>           # all frames
+python scripts/review_sheet.py --images work/frames/<session> --only boxes
+```
+
+`work/review_sheets/<session>.html`: the raw frame with the VLM's boxes
+(resolved exactly as 03 will read them) beside the onboard detector's frame
+from the same moment. Disagreements are where one of them is wrong — fix the
+label (03 `review/`) or count it as something retraining should fix.
 
 If more than half the frames come back empty, the model probably isn't seeing
 the images at all (a text-only model returns `{"boxes": []}` forever). The script
@@ -774,13 +845,15 @@ passed.
 ```
 airseekers-yolo-retrain/
 ├── README.md
-├── setup.sh                    one-command setup (+ --check diagnostics, WSL notes)
+├── setup.sh                    one-command setup (--check, --rknn, --rocm, WSL notes)
 ├── requirements.txt            runtime deps for 01-03 (training/test deps are setup.sh's)
+├── requirements-export.txt     .venv-export for 05 (rknn-toolkit2 and its pins)
 ├── config/pipeline.yaml        one file for the whole pipeline (incl. mower profiles)
 ├── scripts/
 │   ├── common.py               config, paths, profiles, hashing, MJPEG/ffmpeg, manifest io
 │   ├── 01_capture.py           mower MJPEG/snapshot/RTSP, or a local folder of images+videos
 │   ├── 02_llm_label.py         LM Studio / OpenAI-compatible vision labelling
+│   ├── review_sheet.py         HTML: VLM boxes beside the onboard detector's frame
 │   ├── 03_to_yolo.py           validate + convert to YOLO + data.yaml + hand labels
 │   ├── 04_train.sh             ultralytics train + val (ROCm notes)
 │   ├── 05_export_rknn.sh       airockchip export + ONNX check + rknn-toolkit2 + self-check

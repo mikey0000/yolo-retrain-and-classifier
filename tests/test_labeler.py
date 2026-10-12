@@ -50,3 +50,31 @@ def test_encode_image_reports_sent_and_original_size(labeler, names, tmp_path):
     img = make_jpeg(tmp_path / "big.jpg", size=(1920, 1080))
     _url, sent, orig = lab.encode_image(img)
     assert orig == (1920, 1080) and sent == (1024, 576)
+
+
+def test_reference_image_sent_only_for_matching_view(labeler, names, tmp_path):
+    from conftest import make_jpeg
+    lab = _labeler(labeler, names)
+    lab.cfg.use_reference = True
+    lab.cfg.reference_prompt = "hint"
+    same = make_jpeg(tmp_path / "same.jpg", size=(320, 240))
+    other = make_jpeg(tmp_path / "other.jpg", size=(320, 180))
+    assert lab.reference_url(same, (640, 480)).startswith("data:image/jpeg")
+    assert lab.reference_url(other, (640, 480)) is None   # 16:9 vs 4:3
+    assert lab.reference_url(None, (640, 480)) is None
+    lab.cfg.use_reference = False
+    assert lab.reference_url(same, (640, 480)) is None
+
+    body = lab.build_body("data:a", "v", "data:ref")
+    parts = body["messages"][1]["content"]
+    assert [p["type"] for p in parts] == ["text", "image_url", "text", "image_url"]
+    assert parts[1]["image_url"]["url"] == "data:a"     # the frame to label comes first
+    assert "reasoning_effort" not in body
+    lab.cfg.reasoning_effort = "none"
+    assert lab.build_body("data:a", "v")["reasoning_effort"] == "none"
+
+
+def test_empty_reply_from_token_limit_says_why(labeler, names):
+    out = _labeler(labeler, names).parse_reply(
+        {"choices": [{"message": {"content": ""}, "finish_reason": "length"}]})
+    assert not out["ok"] and "reasoning_effort" in out["error"]

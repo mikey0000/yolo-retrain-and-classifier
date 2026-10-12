@@ -17,6 +17,7 @@ paths:
   labels_dir: work/labels       # 02: raw LLM responses, one JSON per frame
   dataset_dir: work/dataset     # 03: images/{train,val} labels/{train,val} data.yaml
   models_dir: work/models       # 05: .onnx and .rknn artefacts
+  reference_dir: work/reference # 01: onboard detector frames paired with captures
   runs_dir: runs                 # 04: ultralytics run directories
 
 # ---------------------------------------------------------------------------
@@ -83,7 +84,7 @@ classes:
 # /vio/right/image_raw (640x480); it is kept in the ros1 profile as secondary.
 # ---------------------------------------------------------------------------
 mower:
-  profile: ros1                  # ros1 | ros2
+  profile: ros2                  # ros1 | ros2
   host: 192.168.1.105
   base_url: null                 # null -> http://<host>:<profiles.<profile>.port>
   # http = web_video_server MJPEG/snapshot (default); rtsp = the mower's
@@ -152,21 +153,36 @@ profiles:
       - "web_video_server is off by default in the ROS 2 stack:"
       - "  ros2 launch mower_bringup cameras.launch.py web_video_server:=true"
       - "check the topic on the mower: ros2 topic hz {topic}"
+      - "topic list: http://<mower>:8080/"
+    # `enabled: false` cameras are captured only when named in --cameras.
+    # `reference:` = a topic saved next to every kept frame. The onboard
+    # detector's annotated image shows what the deployed model thinks is an
+    # object; 02 shows it to the VLM as a hint to correct, review_sheet.py
+    # puts it beside the VLM's boxes for validation.
     cameras:
+      front:
+        topic: /vio/right/image_raw
+        mode: stream
+        rate_hz: 1.0
+        reference: /ai/det/image_annotated
+        note: default capture source — stereo right eye
       left_oa:
         topic: /left_oa_camera/image_raw
         mode: stream
         rate_hz: 1.0
-        note: primary — det_ros input (GC2093 1920x1080)
+        enabled: false
+        note: det_ros input (GC2093 1920x1080)
       right_oa:
         topic: /right_oa_camera/image_raw
         mode: stream
         rate_hz: 1.0
-        note: primary — det_ros input (GC2093 1920x1080)
+        enabled: false
+        note: det_ros input (GC2093 1920x1080)
       rear:
         topic: /rear_camera/image_raw
         mode: snapshot
         rate_hz: 0.25
+        enabled: false
         note: not a det_ros input; extra data only, keep the rate low
 
 capture:
@@ -181,6 +197,9 @@ capture:
   # it a static scene burns the whole session re-fetching the same picture —
   # against a single-threaded web_video_server that is also rude to the mower.
   stop_after_dup_run: 5
+  # A reference frame older than this when a raw frame is kept is not saved
+  # (it would show a different moment).
+  reference_max_age_s: 2.0
   # Save the bytes exactly as received (reencode: false) or downscale with PIL.
   reencode: false
   jpeg_quality: 90
@@ -207,8 +226,13 @@ capture:
 # LM Studio default base URL: http://127.0.0.1:1234/v1  (Developer tab -> Start)
 # ---------------------------------------------------------------------------
 llm:
-  base_url: http://127.0.0.1:1234/v1
-  model: ""                      # empty -> discovered from GET /v1/models
+  # auto = $LLM_BASE_URL, else http://127.0.0.1:1234/v1, else the Windows host
+  # through WSL NAT (http://<default gateway>:1234/v1). Or set a URL.
+  base_url: auto
+  # Explicit, because LM Studio's /v1/models lists every downloaded model
+  # (JIT loading), text-only ones included. Qwen 3.x VL models answer in the
+  # 0-1000 box space the prompt asks for. Check with `lms ls`.
+  model: qwen/qwen3.6-27b
   api_key: lm-studio             # sent as a bearer token; LM Studio ignores it
   # Vision-capable models that work with this client in LM Studio:
   #   qwen2.5-vl-7b-instruct, qwen2.5-vl-3b-instruct, gemma-3-12b-it,
@@ -220,6 +244,9 @@ llm:
   temperature: 0.0               # 0.0 or labels are not reproducible
   max_tokens: 1024
   top_p: 1.0
+  # Reasoning models (Qwen 3.x, Gemma 4) otherwise think for hundreds of tokens
+  # per frame and can hit max_tokens before the JSON. "" = don't send it.
+  reasoning_effort: none
   # json_object = ask for a JSON grammar; json_schema = pin the shape;
   # none = prompt only (use if the loaded model rejects the parameter).
   response_format: json_object
@@ -228,6 +255,11 @@ llm:
   # pixels answers in THAT space; 03 rescales pixel boxes by original/sent.
   max_edge: 1024
   jpeg_quality: 85
+  # Send the onboard detector's annotated frame (01 `reference:`) as a second
+  # image, marked as a fallible hint. Skipped per frame when its aspect ratio
+  # does not match the raw frame. --no-reference turns it off for a run.
+  use_reference: true
+  reference_prompt: ""           # empty -> built-in text (02 DEFAULT_REFERENCE_PROMPT)
   # Frames to skip, glob patterns (these never reach the LLM).
   skip_patterns: ["*_review*.jpg"]
   system_prompt: |
