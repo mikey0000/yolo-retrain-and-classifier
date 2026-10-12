@@ -4,11 +4,15 @@ Capture frames from an Airseekers mower's cameras, get bounding boxes from a
 local vision LLM, convert them to a YOLO dataset, train, and export back to a
 Rockchip `.rknn` that the ROS 2 `det_ros` node can load.
 
-Everything runs on **your LAN host**. The mower is only read over HTTP, and
-nothing is installed or written on it. Its HTTP camera server must be up,
+Everything runs on **your LAN host**. The mower is only read (HTTP or RTSP),
+and nothing is installed or written on it. Its camera servers must be up,
 though: on the vendor ROS 1 firmware `web_video_server` (port 8181) is always
 running; on the ROS 2 port it is off until you launch
-`cameras.launch.py web_video_server:=true` (port 8080).
+`cameras.launch.py web_video_server:=true` (port 8080), while the mediamtx
+RTSP relay (port 8554) is always up.
+
+**Setup is one command: `./setup.sh`** (Linux, macOS or Windows-under-WSL —
+see [Setup](#setup)).
 
 ---
 
@@ -65,9 +69,9 @@ way (05).
 ## The flow
 
 ```
-  01_capture.py      mower MJPEG / snapshot ──┐
-                     (profile ros1 | ros2)    ├──>  frames/<session>/<cam>/*.jpg
-                     local folder          ───┘     frames/<session>/manifest.jsonl
+  01_capture.py      mower MJPEG / snapshot / RTSP ─┐
+                     (profile ros1 | ros2)           ├──>  frames/<session>/<cam>/*.jpg
+                     local folder / video files  ────┘     frames/<session>/manifest.jsonl
                                                         │
                                                         ▼
   02_llm_label.py    LM Studio (OpenAI-compatible, vision model, LAN)
@@ -97,28 +101,28 @@ way (05).
 
 ## Setup
 
+### The short version
+
 ```bash
 git clone <this repo> airseekers-yolo-retrain
 cd airseekers-yolo-retrain
-
-python3 -m venv .venv && source .venv/bin/activate
-pip install pyyaml requests pillow          # runtime (01-03, calibration)
-pip install ultralytics                     # 04 (torch comes with it)
-pip install pytest                          # tests/
-
-# 05 exports with the Rockchip fork, next to this repo by default
-# (export.airockchip_repo: ../ultralytics_yolov8). It is put on PYTHONPATH
-# for the export only, so it does not replace your pip ultralytics.
-git clone https://github.com/airockchip/ultralytics_yolov8 ../ultralytics_yolov8
+./setup.sh                      # .venv + deps + airockchip fork + tests
+source .venv/bin/activate       # once per shell
 ```
 
-For the `.rknn` conversion step, on an **x86_64** host:
+`setup.sh` is idempotent — re-run it after a `git pull` and it tops up whatever
+is missing. When `uv` is on your PATH it builds the venv and installs with uv;
+otherwise it falls back to `python3 -m venv` + pip. Options:
 
 ```bash
-pip install rknn-toolkit2==2.3.0            # the version the shipped models used
+./setup.sh --check      # diagnose an existing install, change nothing
+./setup.sh --minimal    # runtime only (01-03): no torch, no fork
+./setup.sh --rknn       # also rknn-toolkit2==2.3.0 for 05 (x86_64, python <= 3.12)
+./setup.sh --help
 ```
 
-Edit `config/pipeline.yaml`. The values you must check before anything works:
+Then edit `config/pipeline.yaml`. The values you must check before anything
+works:
 
 ```yaml
 mower:
@@ -132,6 +136,85 @@ Every value can also be overridden per run without editing the file:
 ```bash
 python3 scripts/01_capture.py --set capture.duration_s=30 --set mower.base_url=http://10.0.0.5:8181
 ```
+
+Confirm the install and the mower in one go:
+
+```bash
+./setup.sh --check                      # deps, fork, torch backend, tests
+python3 scripts/01_capture.py --probe   # is the mower answering?
+```
+
+### Windows: run it in WSL
+
+This is plain Python + bash, so WSL 2 *is* the supported Windows story. Install
+it (`wsl --install -d Ubuntu` in PowerShell), then run the four commands above
+inside the distro. Five things worth knowing first:
+
+1. **Clone into the Linux filesystem** — `~/git/airseekers-yolo-retrain`, not
+   `C:\...` (i.e. not `/mnt/c/...`). `/mnt/c` is several times slower for pip
+   and torch, and it has no hardlinks, so `03_to_yolo.py` degrades to copying
+   every frame (double the disk, double the time). Clone *inside* WSL with the
+   WSL `git`, not Windows git (line endings, exec bits).
+2. **GPU.** NVIDIA works in WSL2 through the Windows driver — do **not**
+   install a Linux NVIDIA driver inside WSL; a CUDA wheel of torch is enough.
+   AMD ROCm does not work under WSL, so `04_train.sh` falls back to CPU there.
+   `./setup.sh --check` prints the backend torch reports.
+3. **LM Studio runs on Windows, WSL2 sits behind NAT**, so an LM Studio server
+   bound to `127.0.0.1` is unreachable from inside WSL. Either enable mirrored
+   networking (Windows 11: `%USERPROFILE%\.wslconfig` → `networkingMode=mirrored`
+   — then `http://127.0.0.1:1234/v1` works unchanged) or bind LM Studio to
+   `0.0.0.0` and point `llm.base_url` at the Windows host IP (the
+   `nameserver` in `/etc/resolv.conf`).
+4. **The mower needs nothing special.** It is a plain LAN server (HTTP on
+   8181/8080, RTSP on 8554) and WSL2 reaches it like any other host.
+   `python3 scripts/01_capture.py --probe` is the check. RTSP capture needs
+   `ffmpeg`, which installs inside WSL like any other package
+   (`sudo apt install ffmpeg`).
+5. **`rknn-toolkit2` is x86_64-only.** x86 WSL is fine (`./setup.sh --rknn`);
+   Windows-on-ARM WSL is not — export the ONNX there (`05 --skip-rknn`) and
+   convert on an x86 host.
+
+### Manual setup (if you would rather not run `setup.sh`)
+
+```bash
+git clone <this repo> airseekers-yolo-retrain
+cd airseekers-yolo-retrain
+
+python3 -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt        # runtime (01-03, calibration)
+pip install ultralytics                # 04 (torch comes with it)
+pip install pytest                     # tests/
+
+# 05 exports with the Rockchip fork, next to this repo by default
+# (export.airockchip_repo: ../ultralytics_yolov8). It is put on PYTHONPATH
+# for the export only, so it does not replace your pip ultralytics.
+git clone https://github.com/airockchip/ultralytics_yolov8 ../ultralytics_yolov8
+```
+
+The same three installs with uv instead of venv + pip:
+
+```bash
+uv venv --seed
+uv pip install -r requirements.txt ultralytics pytest
+```
+
+One system package, used by RTSP capture and by folder imports of video
+files (optional, but install it unless you only ever capture over HTTP):
+
+```bash
+sudo apt install ffmpeg        # `./setup.sh --check` reports it
+```
+
+For the `.rknn` conversion step, on an **x86_64** host (x86 WSL counts):
+
+```bash
+pip install rknn-toolkit2==2.3.0            # the version the shipped models used
+```
+
+Python **3.10 or newer** is required. `rknn-toolkit2` is the exception: its
+wheels stop at Python **3.12**, so the 05 conversion step needs a 3.12 venv
+(`./setup.sh --rknn` switches to a uv-managed 3.12 by itself when uv is
+available).
 
 Run the unit tests (no GPU, no network, no mower):
 
@@ -156,7 +239,7 @@ Two profiles (`mower.profile`, or `--profile`):
 | HTTP port | 8181, always on | 8080, **off by default** — `ros2 launch mower_bringup cameras.launch.py web_video_server:=true` |
 | Cameras in the preset | `left_oa`, `right_oa` (primary, 1 Hz), `front` = `/vio/right` (0.5 Hz), `front_left` = `/vio/left` (0.25 Hz), `rear` (0.25 Hz) | `left_oa`, `right_oa` (primary, 1 Hz), `rear` (0.25 Hz) |
 | Gating | OA + rear need `rosservice call /<cam>/start_capture "{}"` | no start_capture services |
-| RTSP | — | 8554 via mediamtx (`docker/docker-compose.video.yml`), for viewers; 01 reads HTTP |
+| RTSP | — | 8554 via mediamtx (`docker/docker-compose.video.yml`) — 01 reads it with ffmpeg, `--transport rtsp` |
 
 Check what's answering first. `--probe` fetches one frame per camera through
 the exact URL capture would use (streams are read until the first JPEG, then
@@ -168,13 +251,23 @@ python3 scripts/01_capture.py --probe --profile ros2
 ```
 
 ```
-probing http://192.168.1.105:8181  (profile ros1)
+probing http://192.168.1.105:8181  (profile ros1, transport http)
   OK    left_oa      /left_oa_camera/image_raw  1920x1080  271 KiB  88 ms  [snapshot]
   EMPTY right_oa     /right_oa_camera/image_raw  no JPEG after 5031 ms  [snapshot]
          -> topic silent, or the camera needs: rosservice call /right_oa_camera/start_capture '{}'
          -> (mower_cam_keeper.service normally does this when a viewer subscribes)
          -> check the topic on the mower: rostopic hz /right_oa_camera/image_raw
   ...
+```
+
+An RTSP source probes the same way (it shows the URL, since the URL *is* what
+you would change):
+
+```
+probing rtsp://192.168.1.105:8554  (profile ros2, transport rtsp)
+  OK    left_oa      rtsp://192.168.1.105:8554/left_oa  320x240  46 KiB  12 ms  [rtsp]
+  EMPTY rear         rtsp://192.168.1.105:8554/rear  no data within 10 s after 10003 ms  [rtsp]
+         -> list what the relay publishes: ffprobe rtsp://192.168.1.105:8554/rear
 ```
 
 (The numbers above are illustrative; the line format is what the script prints.)
@@ -197,13 +290,49 @@ python3 scripts/01_capture.py \
 # any MJPEG server at all
 python3 scripts/01_capture.py --url front='http://<host>:8181/stream?topic=/vio/right/image_raw&type=mjpeg'
 
-# no mower: import frames you already have
+# no mower: import frames you already have (and video files, see below)
 python3 scripts/01_capture.py --folder ~/pics/lawn --rate 2
 ```
 
 `--base-url` applies to every source (stream URLs, snapshot URLs and the
 probe). Stream-mode and snapshot-mode cameras run together in one session, one
 thread per camera, so a silent snapshot topic cannot stall the others.
+
+### The same mower over RTSP
+
+The ROS 2 stack relays every camera through mediamtx on port **8554**, named
+after the camera (`rtsp://<mower>:8554/left_oa`). 01 pulls those directly with
+one ffmpeg per camera — useful when `web_video_server` is off, busy, or you
+would rather not run it at all:
+
+```bash
+sudo apt install ffmpeg        # system package; `./setup.sh --check` reports it
+
+python3 scripts/01_capture.py --rtsp left_oa=rtsp://192.168.1.105:8554/left_oa
+python3 scripts/01_capture.py --transport rtsp --cameras left_oa,right_oa
+# ...or make it the default:  mower.transport: rtsp  in config/pipeline.yaml
+```
+
+`profiles.ros2.rtsp_url` is the URL template (`rtsp://{host}:8554/{name}`; a
+camera may set `rtsp: <url>` on its own to opt in individually). ffmpeg
+decimates to the camera's `rate_hz`, and dedupe, quota and the manifest behave
+exactly as over HTTP — a dropped feed reconnects with a short backoff instead
+of ending the session. Transport is TCP by default (`capture.rtsp_transport`)
+because UDP reorders and drops under load, which corrupts frames. Check a path
+before capturing: `ffprobe rtsp://192.168.1.105:8554/left_oa`.
+
+### Folder import: images *and* videos
+
+`--folder DIR` takes what you already have. Images are used as-is (dedupe is
+**off**: you curated them). Video files (`.mp4 .mov .avi .mkv .m4v .webm`) are
+decoded with ffmpeg when `capture.folder.videos: true` (the default), at
+`video_rate_hz` frames per second *of video*, and those frames **do** get
+dedupe — raw video is full of near-duplicates:
+
+```bash
+python3 scripts/01_capture.py --folder ~/clips --probe         # counts images+videos
+python3 scripts/01_capture.py --folder ~/clips --max-frames 400
+```
 
 Output:
 
@@ -236,8 +365,9 @@ manifest yourself, 03 can split by pose cell (see 03).
   emits identical frames at the full topic rate and would otherwise write
   hundreds of copies of the same picture. After `stop_after_dup_run` (5)
   consecutive rejects a camera is stopped — the scene has stopped changing.
-  This applies to stream and snapshot cameras alike (not to `--folder` imports,
-  where dedupe is off).
+  This applies to stream, snapshot and RTSP cameras alike, and to video frames
+  decoded from a folder import; hand-picked image files are exempt (dedupe is
+  off for those, because you already chose them).
 - **Disk is capped.** Capture stops when the *session* (all cameras together)
   reaches `quota_bytes` (2 GiB) and prunes the oldest sessions when all
   sessions exceed `total_quota_bytes` (12 GiB). It never raises. The mower is
@@ -644,10 +774,12 @@ passed.
 ```
 airseekers-yolo-retrain/
 ├── README.md
+├── setup.sh                    one-command setup (+ --check diagnostics, WSL notes)
+├── requirements.txt            runtime deps for 01-03 (training/test deps are setup.sh's)
 ├── config/pipeline.yaml        one file for the whole pipeline (incl. mower profiles)
 ├── scripts/
-│   ├── common.py               config, paths, profiles, hashing, MJPEG, manifest io
-│   ├── 01_capture.py           mower MJPEG/snapshot or a local folder
+│   ├── common.py               config, paths, profiles, hashing, MJPEG/ffmpeg, manifest io
+│   ├── 01_capture.py           mower MJPEG/snapshot/RTSP, or a local folder of images+videos
 │   ├── 02_llm_label.py         LM Studio / OpenAI-compatible vision labelling
 │   ├── 03_to_yolo.py           validate + convert to YOLO + data.yaml + hand labels
 │   ├── 04_train.sh             ultralytics train + val (ROCm notes)
@@ -707,6 +839,50 @@ sourcing:
 ---
 
 ## CHANGELOG
+
+### 2026-10-09 — RTSP capture and video files for 01
+
+- **01 can read the mower over RTSP.** `mower.transport: rtsp` (or
+  `--transport rtsp`) pulls every camera from `profiles.<profile>.rtsp_url`
+  (mediamtx on :8554, template `rtsp://{host}:8554/{name}`); a camera may set
+  `rtsp: <url>` on its own to opt in individually. CLI: repeatable
+  `--rtsp name=rtsp://...`. One ffmpeg per camera does the decode and
+  decimates to the camera's `rate_hz`; dedupe, quota, the consecutive-dup stop
+  and the manifest are identical to the HTTP path, and a dropped feed
+  reconnects with backoff instead of ending the session. RTSP/`--probe`
+  reports ffmpeg's own diagnostics. TCP transport by default
+  (`capture.rtsp_transport`).
+- **Folder import decodes video files.** `capture.folder.videos: true` (now the
+  default) decodes `.mp4/.mov/.avi/.mkv/.m4v/.webm` found under `--folder` at
+  `capture.folder.video_rate_hz` fps *of video*; those frames get dedupe (raw
+  video is full of near-duplicates), the hand-picked image files still do not.
+  Provenance records `source: video` + `original_name` for decoded frames.
+- **`./setup.sh --check`** reports the `ffmpeg` binary (RTSP + video need it).
+
+### 2026-10-09 — one-command setup, WSL
+
+- **`setup.sh`** replaces the manual pip/clone list: creates `.venv`, installs
+  `requirements.txt` (+ ultralytics/pytest unless `--minimal`), clones the
+  airockchip fork where `export.airockchip_repo` points, runs `tests/`. Flags:
+  `--rknn` (rknn-toolkit2 at the pinned version), `--no-fork`, `--no-tests`,
+  `--fork-dir`, and `--check`, which diagnoses an existing install (python
+  version, each dependency, torch backend, fork, toolkit, tests) without
+  changing anything. Idempotent. Python >= 3.10 is now stated explicitly (the
+  code already uses `dict | None` unions).
+  - **uv first**: when `uv` is on PATH it creates the venv and installs
+    (falling back to `python3 -m venv` + pip). `PYTHON=3.12 ./setup.sh` asks
+    uv for that interpreter; `--rknn` does it automatically when the system
+    python is newer than 3.12, because rknn-toolkit2's wheels stop at cp312.
+- **`requirements.txt`** — pyyaml/requests/pillow, so the manual path is one
+  `pip install -r` instead of three package names.
+- **WSL documented** in README Setup: clone into the Linux filesystem (not
+  `/mnt/c` — no hardlinks, so 03 would copy every frame), NVIDIA-vs-ROCm
+  expectations, LM Studio reachability across the WSL2 NAT (mirrored
+  networking or bind 0.0.0.0), mower needs nothing special, rknn-toolkit2 is
+  x86_64-only. `setup.sh` prints a short version of the same notes when it
+  detects WSL.
+- **04/05 use `.venv/bin/python` automatically** when it exists, so those two
+  steps work without `source .venv/bin/activate` first.
 
 ### 2026-10-06 — code-review fixes
 

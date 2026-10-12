@@ -167,10 +167,18 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-PYTHON="${PYTHON:-python3}"
-command -v "$PYTHON" >/dev/null 2>&1 || { echo "ERROR: python3 not found" >&2; exit 1; }
+# Prefer the repo's own venv so 05 works without `source .venv/bin/activate`
+# first; PYTHON in the environment still wins.
+if [[ -z "${PYTHON:-}" ]]; then
+  if [[ -x "$REPO_ROOT/.venv/bin/python" ]]; then
+    PYTHON="$REPO_ROOT/.venv/bin/python"
+  else
+    PYTHON=python3
+  fi
+fi
+command -v "$PYTHON" >/dev/null 2>&1 || { echo "ERROR: python not found ($PYTHON)" >&2; exit 1; }
 "$PYTHON" -c "import yaml" 2>/dev/null || {
-  echo "ERROR: pyyaml required.  pip install pyyaml" >&2; exit 1; }
+  echo "ERROR: pyyaml required.  ./setup.sh, or: pip install pyyaml" >&2; exit 1; }
 
 cfg() {
   "$PYTHON" - "$CONFIG" "$1" "${2-}" <<'PY'

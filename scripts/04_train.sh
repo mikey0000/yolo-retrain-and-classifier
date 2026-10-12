@@ -86,6 +86,16 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(dirname "$SCRIPT_DIR")"
 cd "$REPO_ROOT"
 
+# Prefer the repo's own venv, so these steps work without
+# `source .venv/bin/activate` first. PYTHON in the environment still wins.
+if [[ -z "${PYTHON:-}" ]]; then
+  if [[ -x "$REPO_ROOT/.venv/bin/python" ]]; then
+    PYTHON="$REPO_ROOT/.venv/bin/python"
+  else
+    PYTHON=python3
+  fi
+fi
+
 CONFIG="config/pipeline.yaml"
 WEIGHTS=""
 DATA=""
@@ -158,14 +168,12 @@ while [[ $# -gt 0 ]]; do
 done
 
 # --- read the config ------------------------------------------------------
-if ! command -v python3 >/dev/null 2>&1; then
-  echo "ERROR: python3 not found" >&2; exit 1
-fi
-python3 -c "import yaml" 2>/dev/null || {
-  echo "ERROR: pyyaml is required to read $CONFIG.  pip install pyyaml" >&2; exit 1; }
+command -v "$PYTHON" >/dev/null 2>&1 || { echo "ERROR: python not found ($PYTHON)" >&2; exit 1; }
+"$PYTHON" -c "import yaml" 2>/dev/null || {
+  echo "ERROR: pyyaml is required to read $CONFIG.  ./setup.sh, or: pip install pyyaml" >&2; exit 1; }
 
 cfg() {  # cfg <dotted.key> [default]
-  python3 - "$CONFIG" "$1" "${2-}" <<'PY'
+  "$PYTHON" - "$CONFIG" "$1" "${2-}" <<'PY'
 import sys, yaml
 path, key, default = sys.argv[1], sys.argv[2], sys.argv[3]
 node = yaml.safe_load(open(path)) or {}
@@ -185,7 +193,6 @@ PY
 }
 
 # --- environment detection ------------------------------------------------
-PYTHON="${PYTHON:-python3}"
 DEVICE_MODE="${DEVICE:-$(cfg train.device auto)}"
 AMP_MODE="${AMP:-$(cfg train.amp auto)}"
 

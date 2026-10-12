@@ -1,0 +1,6 @@
+# Runtime for 01_capture, 02_llm_label, 03_to_yolo and the 05 calibration step.
+# Installed by ./setup.sh. Training (ultralytics/torch), pytest and
+# rknn-toolkit2 are added by setup.sh flags — see ./setup.sh --help.
+pyyaml>=6.0
+requests>=2.28
+pillow>=9.0

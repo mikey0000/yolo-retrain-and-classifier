@@ -22,10 +22,15 @@ import json
 import logging
 import os
 import re
+import select
+import shutil
+import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 from typing import Any, Iterable, Iterator, Sequence
+from urllib.parse import urlparse
 
 try:
     import yaml
@@ -325,6 +330,28 @@ def mower_base_url(cfg: dict) -> str:
     return f"http://{host}:{port}" if port else f"http://{host}"
 
 
+def mower_transport(cfg: dict) -> str:
+    """``http`` (web_video_server MJPEG, default) or ``rtsp`` (mediamtx)."""
+    return str(get_dotted(cfg, "mower.transport", "http") or "http").lower()
+
+
+def mower_host(cfg: dict) -> str:
+    """Hostname for RTSP templates: ``mower.host``, else the host in base_url."""
+    host = get_dotted(cfg, "mower.host")
+    if host:
+        return str(host)
+    return urlparse(mower_base_url(cfg)).hostname or ""
+
+
+def build_rtsp_url(template: str, host: str, name: str, topic: str = "") -> str:
+    """Fill an RTSP template: ``{host}``, ``{name}`` (camera) and ``{topic}``.
+
+    The mower's mediamtx relay names streams after the camera
+    (``rtsp://<host>:8554/left_oa``), so ``{name}`` is the usual placeholder.
+    """
+    return template.format(host=host, name=name, topic=topic.lstrip("/"))
+
+
 def camera_presets(cfg: dict) -> dict:
     """Camera presets: a top-level ``cameras:`` block wins (legacy configs),
     otherwise the active profile's ``cameras``."""
@@ -351,6 +378,7 @@ class StreamSpec:
     name: str
     url: str
     mode: str = "stream"      # "stream" (multipart) | "snapshot" (single JPEG)
+                               # | "rtsp" (ffmpeg pulls the RTSP URL)
     rate_hz: float = 1.0
     topic: str = ""
 
@@ -363,6 +391,51 @@ def build_stream_url(base_url: str, template: str, topic: str) -> str:
     return f"{base}{path}"
 
 
+class _JpegScanner:
+    """SOI..EOI framing over an arbitrary chunk stream.
+
+    Both of our byte streams are "JPEGs concatenated with whatever the
+    transport felt like writing", so they share this scanner:
+
+    * web_video_server emits ``Content-Length`` per MJPEG part in some builds
+      and nothing in others, so headers are not trustworthy;
+    * ffmpeg's ``image2pipe`` output and any interleaved noise must be skipped
+      the same way.
+
+    A tail is kept across chunks because a marker can straddle a read
+    boundary.
+    """
+
+    def __init__(self) -> None:
+        self._buf = bytearray()
+
+    def feed(self, chunk: bytes) -> list[bytes]:
+        self._buf.extend(chunk)
+        frames: list[bytes] = []
+        while True:
+            start = self._buf.find(_SOI)
+            if start < 0:
+                # Keep a short tail in case SOI straddles a chunk boundary.
+                if len(self._buf) > 3:
+                    del self._buf[:-3]
+                return frames
+            end = self._buf.find(_EOI, start + 3)
+            if end < 0:
+                # Incomplete frame: drop what we have before start and wait.
+                del self._buf[:start]
+                return frames
+            frames.append(bytes(self._buf[start:end + 2]))
+            del self._buf[:end + 2]
+
+
+def _iter_jpeg_chunks(chunks: Iterable[bytes]) -> Iterator[bytes]:
+    """Yield every complete JPEG found across ``chunks``."""
+    scanner = _JpegScanner()
+    for chunk in chunks:
+        if chunk:
+            yield from scanner.feed(chunk)
+
+
 def iter_mjpeg(url: str, connect_timeout: float = 5.0,
                read_timeout: float = 30.0) -> Iterator[bytes]:
     """Yield JPEG payloads from an HTTP MJPEG (multipart/x-mixed-replace) URL.
@@ -371,10 +444,10 @@ def iter_mjpeg(url: str, connect_timeout: float = 5.0,
 
     1. The stream never ends. This is a generator; the caller must stop
        iterating (the ``with`` in ``capture`` closes the socket on exit).
-    2. web_video_server emits ``Content-Length`` per part in some builds and
-       nothing in others, and some builds return the first frame only after the
-       ROS topic is publishing. We therefore do not trust headers and simply
-       scan for JPEG SOI..EOI pairs, which is robust across servers.
+    2. web_video_server returns the first frame only after the ROS topic is
+       publishing, and part framing varies by build, so instead of trusting
+       headers we scan for JPEG SOI..EOI pairs (``_JpegScanner``), which is
+       robust across servers.
 
     A snapshot request is handled by the same scanner, so ``/snapshot`` works
     even though it is not multipart.
@@ -383,25 +456,7 @@ def iter_mjpeg(url: str, connect_timeout: float = 5.0,
         url, stream=True, timeout=(connect_timeout, read_timeout)
     ) as resp:
         resp.raise_for_status()
-        buf = bytearray()
-        for chunk in resp.iter_content(chunk_size=65536):
-            if not chunk:
-                continue
-            buf.extend(chunk)
-            while True:
-                start = buf.find(_SOI)
-                if start < 0:
-                    # Keep a short tail in case SOI straddles a chunk boundary.
-                    if len(buf) > 3:
-                        del buf[:-3]
-                    break
-                end = buf.find(_EOI, start + 3)
-                if end < 0:
-                    # Incomplete frame: drop what we have before start and wait.
-                    del buf[:start]
-                    break
-                yield bytes(buf[start:end + 2])
-                del buf[:end + 2]
+        yield from _iter_jpeg_chunks(resp.iter_content(chunk_size=65536))
 
 
 def first_mjpeg_frame(url: str, connect_timeout: float = 5.0,
@@ -435,6 +490,155 @@ def first_snapshot(url: str, connect_timeout: float = 5.0,
         return None
     end = body.rfind(_EOI)
     return body[start:end + 2] if end > start else body[start:]
+
+
+# ---------------------------------------------------------------------------
+# rtsp (ffmpeg)
+# ---------------------------------------------------------------------------
+
+def ffmpeg_available() -> bool:
+    """True when the ``ffmpeg`` binary is on PATH (RTSP capture needs it)."""
+    return shutil.which("ffmpeg") is not None
+
+
+def rtsp_cmd(url: str, fps: float = 0.0, transport: str = "tcp",
+             connect_timeout: float = 10.0) -> list[str]:
+    """The ffmpeg argv that decodes one RTSP URL into JPEGs on stdout.
+
+    ``-rtsp_transport tcp`` is deliberate: UDP reorders and drops under load
+    (which corrupts frames), TCP costs a little latency and always arrives
+    intact. ``fps`` decimates in the decoder so we are not decoding frames
+    nobody will keep; 0 means camera rate.
+    """
+    cmd = ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error",
+           "-rtsp_transport", transport,
+           "-rw_timeout", str(int(max(connect_timeout, 1.0) * 1_000_000)),
+           "-i", url, "-an"]
+    if fps and fps > 0:
+        cmd += ["-vf", f"fps={fps:g}"]
+    cmd += ["-q:v", "3", "-f", "image2pipe", "-vcodec", "mjpeg", "-"]
+    return cmd
+
+
+def video_cmd(path: Path | str, fps: float = 0.0) -> list[str]:
+    """The ffmpeg argv that decodes a video file into JPEGs on stdout."""
+    cmd = ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error",
+           "-i", str(path)]
+    if fps and fps > 0:
+        cmd += ["-vf", f"fps={fps:g}"]
+    cmd += ["-q:v", "3", "-f", "image2pipe", "-vcodec", "mjpeg", "-"]
+    return cmd
+
+
+def _read_with_timeout(stream, timeout: float) -> bytes:
+    """One chunk from a pipe, raising TimeoutError when nothing arrives.
+
+    ``read1`` rather than ``read``: ``read(n)`` on a pipe waits for the full
+    ``n`` bytes, and a frame can easily be larger than a chunk.
+    """
+    if timeout <= 0 or not select.select([stream], [], [], max(timeout, 0.0))[0]:
+        raise TimeoutError(f"no data for {timeout:g}s")
+    return stream.read1(65536)
+
+
+def _ffmpeg_stderr(errf, limit: int = 400) -> str:
+    """Tail of ffmpeg's stderr, for error messages (nothing if empty)."""
+    try:
+        errf.seek(0)
+        text = errf.read().decode("utf-8", "replace").strip()
+    except OSError:
+        return ""
+    return text[-limit:]
+
+
+def _ffmpeg_jpegs(cmd: list[str], what: str, connect_timeout: float,
+                  read_timeout: float) -> Iterator[bytes]:
+    """Run an ffmpeg argv and yield the JPEGs it writes to stdout.
+
+    Shared by ``iter_rtsp`` and ``iter_video``: ffmpeg is spawned per call and
+    killed when the caller stops iterating, frames are scanned out of stdout
+    by the same SOI..EOI scanner as MJPEG (so interleaved junk is skipped),
+    and failures raise RuntimeError carrying ffmpeg's own diagnostics —
+    endpoints genuinely fail (wrong path, auth, Wi-Fi drop, corrupt file), and
+    the caller decides whether to reconnect.
+    """
+    if not ffmpeg_available():
+        raise RuntimeError("ffmpeg not found — install it (sudo apt install "
+                           "ffmpeg); it is needed for RTSP and video input")
+    errf = tempfile.TemporaryFile()   # not a pipe: stderr can never block us
+    try:
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=errf)
+    except OSError as exc:
+        errf.close()
+        raise RuntimeError(f"could not run ffmpeg: {exc}") from None
+    scanner = _JpegScanner()
+    try:
+        deadline = time.monotonic() + connect_timeout   # until the first byte
+        while True:
+            try:
+                chunk = _read_with_timeout(proc.stdout,
+                                           deadline - time.monotonic())
+            except TimeoutError:
+                detail = _ffmpeg_stderr(errf)
+                raise RuntimeError(
+                    f"no data from {what} within {connect_timeout:g}s"
+                    + (f": {detail}" if detail else "")) from None
+            if not chunk:
+                break
+            deadline = time.monotonic() + read_timeout
+            for frame in scanner.feed(chunk):
+                yield frame
+        rc = proc.poll()
+        if rc not in (None, 0):
+            raise RuntimeError(f"ffmpeg exited {rc} for {what}: "
+                               f"{_ffmpeg_stderr(errf) or 'no error output'}")
+    finally:
+        try:
+            proc.kill()
+            proc.wait(timeout=5)
+        except Exception:  # pragma: no cover - process already gone
+            pass
+        try:
+            proc.stdout.close()
+        except Exception:  # pragma: no cover
+            pass
+        errf.close()
+
+
+def iter_rtsp(url: str, fps: float = 0.0, transport: str = "tcp",
+              connect_timeout: float = 10.0,
+              read_timeout: float = 30.0) -> Iterator[bytes]:
+    """Yield JPEG frames from an RTSP URL, decoded by ffmpeg.
+
+    ``fps`` asks ffmpeg to decimate (0 = camera rate); the frames still pass
+    through 01's own dedupe and quota, so a static scene costs nothing.
+    """
+    yield from _ffmpeg_jpegs(rtsp_cmd(url, fps, transport, connect_timeout),
+                             url, connect_timeout, read_timeout)
+
+
+def iter_video(path: Path | str, fps: float = 2.0,
+               read_timeout: float = 30.0) -> Iterator[bytes]:
+    """Yield JPEG frames from a video file, decoded by ffmpeg.
+
+    ``fps`` is frames per second *of video* (0 = every frame). A local file
+    decodes as fast as the disk allows, so the caller keeps what it needs and
+    abandons the generator to stop.
+    """
+    yield from _ffmpeg_jpegs(video_cmd(path, fps), str(path),
+                             connect_timeout=10.0, read_timeout=read_timeout)
+
+
+def first_rtsp_frame(url: str, transport: str = "tcp",
+                     connect_timeout: float = 10.0,
+                     read_timeout: float = 30.0) -> bytes | None:
+    """First frame off an RTSP URL, then kill ffmpeg. For ``--probe``."""
+    gen = iter_rtsp(url, fps=0.0, transport=transport,
+                    connect_timeout=connect_timeout, read_timeout=read_timeout)
+    try:
+        return next(gen, None)
+    finally:
+        gen.close()
 
 
 # ---------------------------------------------------------------------------
@@ -515,9 +719,24 @@ def dir_size(path: Path) -> int:
     return total
 
 
-def list_images(root: Path, recursive: bool = True,
-                extensions: Sequence[str] = (".jpg", ".jpeg", ".png")) -> list[Path]:
-    """Sorted image list. Sorted so runs are reproducible across machines."""
+def _list_with_extensions(root: Path, recursive: bool,
+                          extensions: Sequence[str]) -> list[Path]:
+    """Sorted matching file list. Sorted so runs are reproducible across machines."""
     exts = {e.lower() if e.startswith(".") else f".{e.lower()}" for e in extensions}
     it = root.rglob("*") if recursive else root.glob("*")
     return sorted(p for p in it if p.is_file() and p.suffix.lower() in exts)
+
+
+def list_images(root: Path, recursive: bool = True,
+                extensions: Sequence[str] = (".jpg", ".jpeg", ".png")) -> list[Path]:
+    """Sorted image list (see ``_list_with_extensions``)."""
+    return _list_with_extensions(root, recursive, extensions)
+
+
+VIDEO_EXTENSIONS = (".mp4", ".mov", ".avi", ".mkv", ".m4v", ".webm")
+
+
+def list_videos(root: Path, recursive: bool = True,
+                extensions: Sequence[str] = VIDEO_EXTENSIONS) -> list[Path]:
+    """Sorted video list — ``capture.folder.videos`` decodes these (ffmpeg)."""
+    return _list_with_extensions(root, recursive, extensions)

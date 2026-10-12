@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""01_capture.py — grab frames from the mower's LAN MJPEG streams, or a local folder.
+"""01_capture.py — grab frames from the mower's LAN MJPEG streams, RTSP, or a local folder.
 
-Two sources, one output layout:
+Three sources, one output layout:
 
   A. mower   — ``web_video_server`` on the mower: port 8181 on the vendor ROS 1
                firmware (``--profile ros1``), 8080 on the ROS 2 port
@@ -13,7 +13,16 @@ Two sources, one output layout:
                server). Stream and snapshot cameras run together, one thread
                each, in one session.
 
-  B. folder  — an existing directory of JPEGs. No mower, no network, no ROS.
+  B. rtsp    — the mower's mediamtx RTSP relay (``mower.transport: rtsp``, or
+               ``--rtsp name=rtsp://...``), decoded by ffmpeg. One thread and
+               one ffmpeg per camera; ffmpeg decimates to the camera's keep
+               rate, and everything downstream (dedupe, quota, manifest) is
+               identical to the HTTP path. Use this when web_video_server is
+               not running or is contended.
+
+  C. folder  — an existing directory of JPEGs (and video files, decoded with
+               ffmpeg when ``capture.folder.videos`` is on). No mower, no
+               network, no ROS.
 
 Output::
 
@@ -45,6 +54,10 @@ Examples
     # explicit stream URL (any MJPEG server, mower or not)
     python3 scripts/01_capture.py --url rear='http://192.168.1.105:8181/stream?topic=/rear_camera/image_raw&type=mjpeg'
 
+    # the mower's RTSP relay instead of web_video_server (needs ffmpeg)
+    python3 scripts/01_capture.py --rtsp left_oa=rtsp://192.168.1.105:8554/left_oa
+    python3 scripts/01_capture.py --transport rtsp --cameras left_oa,right_oa
+
     # custom web_video_server endpoint from a base URL + ROS topics
     python3 scripts/01_capture.py --base-url http://192.168.1.105:8181 \
         --topic front=/vio/right/image_raw --topic left=/left_oa_camera/image_raw
@@ -52,7 +65,7 @@ Examples
     # probe what the mower is publishing without capturing
     python3 scripts/01_capture.py --probe --base-url http://192.168.1.105:8181
 
-    # no mower: import a folder of frames
+    # no mower: import a folder of frames (and video files, if ffmpeg is there)
     python3 scripts/01_capture.py --folder /path/to/frames --rate 2
 """
 
@@ -70,11 +83,13 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from common import (  # noqa: E402
-    LOG, REPO_ROOT, StreamSpec, add_common_args, append_jsonl, build_stream_url,
-    camera_presets, cfg_path, class_names, dhash, dir_size, first_mjpeg_frame,
-    first_snapshot, get_dotted, hamming, human_bytes, image_size_bytes, iter_mjpeg,
-    list_images, load_config, maybe_reencode, mower_base_url, mower_profile_name,
-    now_iso, setup_logging, silent_topic_hint,
+    LOG, REPO_ROOT, StreamSpec, add_common_args, append_jsonl, build_rtsp_url,
+    build_stream_url, camera_presets, cfg_path, class_names, dhash, dir_size,
+    ffmpeg_available, first_mjpeg_frame, first_rtsp_frame, first_snapshot,
+    get_dotted, hamming, human_bytes, image_size_bytes, iter_mjpeg, iter_rtsp,
+    iter_video, list_images, list_videos, load_config, maybe_reencode,
+    mower_base_url, mower_host, mower_profile, mower_profile_name,
+    mower_transport, now_iso, setup_logging, silent_topic_hint,
 )
 
 _STOP = threading.Event()
@@ -103,10 +118,22 @@ def _on_signal(signum, _frame) -> None:  # pragma: no cover - signal path
 # ---------------------------------------------------------------------------
 
 def stream_from_config(cfg: dict) -> list[StreamSpec]:
-    """Turn the active profile's camera presets into StreamSpecs."""
+    """Turn the active profile's camera presets into StreamSpecs.
+
+    With ``mower.transport: rtsp`` every camera comes from the profile's
+    ``rtsp_url`` template (the mediamtx relay) instead of web_video_server;
+    a camera may also carry its own ``rtsp:`` URL to opt in individually.
+    """
     cameras = camera_presets(cfg)
     if not cameras:
         return []
+    rtsp_transport = mower_transport(cfg)
+    tpl = str(mower_profile(cfg).get("rtsp_url") or "")
+    if rtsp_transport == "rtsp" and not tpl:
+        name = mower_profile_name(cfg)
+        sys.exit(f"ERROR: mower.transport=rtsp but profiles.{name}.rtsp_url is "
+                 f"not set in the config (or drop --transport rtsp and use "
+                 f"--rtsp NAME=rtsp://... instead)")
     url_base = mower_base_url(cfg)
     stream_tpl = get_dotted(cfg, "mower.stream_path", "/stream?topic={topic}&type=mjpeg")
     snap_tpl = get_dotted(cfg, "mower.snapshot_path", "/snapshot?topic={topic}")
@@ -115,20 +142,33 @@ def stream_from_config(cfg: dict) -> list[StreamSpec]:
         if not isinstance(cam, dict) or "topic" not in cam:
             continue
         mode = str(cam.get("mode", "stream"))
+        rate = float(cam.get("rate_hz", 1.0))
+        topic = str(cam["topic"])
+        cam_tpl = str(cam.get("rtsp") or "")
+        if rtsp_transport == "rtsp" or cam_tpl:
+            specs.append(StreamSpec(
+                name=name,
+                url=build_rtsp_url(cam_tpl or tpl, mower_host(cfg), name, topic),
+                mode="rtsp", rate_hz=rate, topic=topic))
+            continue
         specs.append(StreamSpec(
             name=name,
             url=build_stream_url(url_base, snap_tpl if mode == "snapshot" else stream_tpl,
-                                 cam["topic"]),
+                                 topic),
             mode=mode,
-            rate_hz=float(cam.get("rate_hz", 1.0)),
-            topic=str(cam["topic"]),
+            rate_hz=rate,
+            topic=topic,
         ))
     return specs
 
 
 def as_snapshot(cfg: dict, spec: StreamSpec) -> StreamSpec:
-    """Switch a spec to snapshot mode, rebuilding the URL when it has a topic."""
-    if spec.mode == "snapshot":
+    """Switch a spec to snapshot mode, rebuilding the URL when it has a topic.
+
+    RTSP specs are left alone: there is no HTTP snapshot endpoint for them and
+    the RTSP loop already keeps one frame per period.
+    """
+    if spec.mode in ("snapshot", "rtsp"):
         return spec
     url = spec.url
     if spec.topic:
@@ -136,6 +176,27 @@ def as_snapshot(cfg: dict, spec: StreamSpec) -> StreamSpec:
                                get_dotted(cfg, "mower.snapshot_path",
                                           "/snapshot?topic={topic}"), spec.topic)
     return dataclasses.replace(spec, mode="snapshot", url=url)
+
+
+def parse_rtsp_specs(items: list[str], default_rate: float = 1.0) -> list[StreamSpec]:
+    """``--rtsp name=rtsp://...`` entries; a bare URL becomes cam1, cam2, ...
+
+    The bare-URL check runs first because RTSP URLs may themselves contain
+    ``=`` (query parameters), which would fool ``partition``.
+    """
+    specs = []
+    for item in items:
+        item = item.strip()
+        if item.startswith("rtsp://") or "=" not in item:
+            url, name = item, f"cam{len(specs) + 1}"
+            if not url.startswith("rtsp://"):
+                sys.exit(f"ERROR: --rtsp expects an rtsp:// URL, got {url!r}")
+        else:
+            name, _, url = item.partition("=")
+            name, url = name.strip(), url.strip()
+        specs.append(StreamSpec(name=name, url=url, mode="rtsp",
+                                rate_hz=default_rate))
+    return specs
 
 
 def parse_url_specs(items: list[str]) -> list[StreamSpec]:
@@ -177,24 +238,33 @@ def probe(cfg: dict, specs: list[StreamSpec]) -> int:
 
     ``mode: stream`` sources are read with a streaming GET and stopped at the
     first JPEG (a plain GET on an MJPEG URL never finishes); ``mode: snapshot``
-    sources get one ordinary GET. Exit 1 if nothing answered.
+    sources get one ordinary GET; ``mode: rtsp`` sources run ffmpeg until the
+    first frame. Exit 1 if nothing answered.
     """
-    print(f"probing {mower_base_url(cfg)}  (profile {mower_profile_name(cfg)})")
+    print(f"probing {mower_base_url(cfg)}  (profile {mower_profile_name(cfg)}, "
+          f"transport {mower_transport(cfg)})")
     connect_to = float(get_dotted(cfg, "mower.connect_timeout_s", 5.0))
     read_to = float(get_dotted(cfg, "mower.read_timeout_s", 30.0))
+    rtsp_transport = str(get_dotted(cfg, "capture.rtsp_transport", "tcp"))
     alive = 0
     for spec in specs:
         t0 = time.monotonic()
         try:
             if spec.mode == "stream":
                 payload = first_mjpeg_frame(spec.url, connect_to, read_to)
+            elif spec.mode == "rtsp":
+                payload = first_rtsp_frame(spec.url, transport=rtsp_transport,
+                                           connect_timeout=max(connect_to, 10.0),
+                                           read_timeout=read_to)
             else:
                 payload = first_snapshot(spec.url, connect_to, read_to)
             err = ""
         except Exception as exc:  # connection refused, timeout, HTTP error
             payload, err = None, f"{type(exc).__name__}: {exc}"
         dt = (time.monotonic() - t0) * 1000.0
-        label = spec.topic or spec.url
+        # For RTSP the URL *is* the thing to check (ffprobe it); for HTTP the
+        # topic name is what the hints below refer to.
+        label = spec.url if spec.mode == "rtsp" else (spec.topic or spec.url)
         if payload:
             alive += 1
             w, h = image_size_bytes(payload)
@@ -204,8 +274,14 @@ def probe(cfg: dict, specs: list[StreamSpec]) -> int:
         else:
             print(f"  EMPTY {spec.name:<12} {label}  "
                   f"{err or 'no JPEG'} after {dt:.0f} ms  [{spec.mode}]")
-            for hint in silent_topic_hint(cfg, spec.topic or "<topic>"):
-                print(f"         -> {hint}")
+            if spec.mode == "rtsp":
+                print(f"         -> list what the relay publishes: ffprobe {spec.url}")
+                print("         -> or check the template: profiles.<profile>.rtsp_url, "
+                      "mower.transport")
+                print("         -> ffmpeg is missing or broken? (sudo apt install ffmpeg)")
+            else:
+                for hint in silent_topic_hint(cfg, spec.topic or "<topic>"):
+                    print(f"         -> {hint}")
     print(f"\n{alive}/{len(specs)} streams returned a frame")
     return 0 if alive else 1
 
@@ -311,7 +387,7 @@ class CameraWriter:
             "bytes": len(payload),
             "phash": f"{h:016x}",
             "session": self.session_dir.name,
-            "source": "stream" if self.spec.mode == "stream" else "snapshot",
+            "source": self.spec.mode,
             "path": _display_path(path),
         }
 
@@ -363,10 +439,11 @@ def run_capture(cfg: dict, specs: list[StreamSpec], out_dir: Path,
     """Capture every source at once, one thread per camera, into one session.
 
     ``mode: stream`` cameras hold an MJPEG connection and sample off it;
-    ``mode: snapshot`` cameras issue one GET per kept frame. Running each
+    ``mode: snapshot`` cameras issue one GET per kept frame; ``mode: rtsp``
+    cameras get one ffmpeg each, which decimates to the keep rate. Running each
     camera in its own thread means a silent snapshot topic (which blocks for
     up to ``read_timeout_s``) cannot stall the other cameras, and a mixed
-    stream+snapshot config captures both kinds in the same session.
+    config captures all kinds in the same session.
     """
     session_dir, manifest = _open_session(cfg, out_dir)
     LOG.info("session %s -> %s", session_dir.name, session_dir)
@@ -460,9 +537,44 @@ def run_capture(cfg: dict, specs: list[StreamSpec], out_dir: Path,
             if wait > 0 and _STOP.wait(wait):
                 return
 
+    def rtsp_loop(spec: StreamSpec) -> None:
+        """ffmpeg pulls the feed; it already decimates to ``rate_hz``, so every
+        frame it hands us goes straight to keep() — dedupe, quota and the
+        consecutive-duplicate stop all apply exactly as on the HTTP path.
+
+        RTSP feeds drop (Wi-Fi, mediamtx restarts), so a dead feed reconnects
+        with a short backoff and gives up only after ``error_cap`` failures in
+        a row, which is the same contract as the other two loops.
+        """
+        writer = writers[spec.name]
+        transport = str(get_dotted(cfg, "capture.rtsp_transport", "tcp"))
+        fps = spec.rate_hz if spec.rate_hz > 0 else 0.0
+        failures = 0
+        while not should_stop(writer):
+            try:
+                for payload in iter_rtsp(spec.url, fps=fps, transport=transport,
+                                         connect_timeout=max(connect_to, 10.0),
+                                         read_timeout=read_to):
+                    failures = 0
+                    if should_stop(writer):
+                        return
+                    keep(writer, payload)
+                failures += 1   # ffmpeg ended on its own: reconnect, with backoff
+                LOG.debug("rtsp '%s': feed ended, reconnecting", spec.name)
+            except Exception as exc:
+                failures += 1
+                LOG.warning("rtsp '%s' failed (%s)", spec.name, exc)
+            if failures >= error_cap:
+                LOG.error("'%s' failed %d times in a row — giving up on it",
+                          spec.name, error_cap)
+                return
+            if _STOP.wait(min(float(failures), 5.0)):
+                return
+
     threads = []
     for spec in specs:
-        target = snapshot_loop if spec.mode == "snapshot" else stream_loop
+        target = {"snapshot": snapshot_loop, "rtsp": rtsp_loop}.get(spec.mode,
+                                                                    stream_loop)
         th = threading.Thread(target=target, args=(spec,), name=f"cap-{spec.name}",
                               daemon=True)
         th.start()
@@ -481,21 +593,36 @@ def run_capture(cfg: dict, specs: list[StreamSpec], out_dir: Path,
 
 def run_folder_capture(cfg: dict, folder: Path, out_dir: Path,
                        rate_hz: float, max_frames: int) -> dict:
-    """Import existing images. No network, no ROS, no mower involved."""
+    """Import existing images and (when enabled) video files.
+
+    No network, no ROS, no mower involved. Dedupe is OFF for the image files —
+    those were curated by hand, so dropping half of them would be worse than
+    useless — but ON for decoded video frames, which are raw and full of
+    near-duplicates, exactly like the live path.
+    """
     fcfg = get_dotted(cfg, "capture.folder", {}) or {}
     recursive = bool(fcfg.get("recursive", True))
     extensions = fcfg.get("extensions", [".jpg", ".jpeg", ".png", ".bmp"])
+    want_videos = bool(fcfg.get("videos", True))
     cam_name = str(args_folder_camera(cfg))
 
     session_dir, manifest = _open_session(cfg, out_dir)
 
     files = list_images(folder, recursive, extensions)
-    if not files:
-        LOG.error("no images under %s (extensions=%s)", folder, extensions)
+    videos = list_videos(folder, recursive) if want_videos else []
+    if not files and not videos:
+        if want_videos:
+            LOG.error("no images or videos under %s (image extensions=%s)",
+                      folder, extensions)
+        else:
+            LOG.error("nothing to import under %s (image extensions=%s, and %d "
+                      "video(s) present but capture.folder.videos is false)",
+                      folder, extensions, len(list_videos(folder, recursive)))
         return {"kept": 0, "errors": 1}
-    if max_frames:
+    if max_frames and files:
         files = files[:max_frames]
-    LOG.info("importing %d images from %s", len(files), folder)
+    LOG.info("importing %d images and %d videos from %s",
+             len(files), len(videos), folder)
 
     writer = CameraWriter(
         spec=StreamSpec(name=cam_name, url=str(folder), mode="snapshot",
@@ -530,7 +657,44 @@ def run_folder_capture(cfg: dict, folder: Path, out_dir: Path,
             rec["source"] = "folder"
             append_jsonl(manifest, rec)
 
+    if videos:
+        _decode_videos(videos, writer, manifest, cfg, video_rate=float(
+            fcfg.get("video_rate_hz", 2.0)), max_frames=max_frames)
+
     return summarise(cfg, session_dir, manifest, {cam_name: writer}, folder=True)
+
+
+def _decode_videos(videos: list[Path], writer: CameraWriter, manifest: Path,
+                   cfg: dict, video_rate: float, max_frames: int) -> None:
+    """Feed decoded video frames through the same writer as everything else.
+
+    ``capture.folder.videos`` is the switch (config) — with it false a folder
+    import behaves exactly as it always has. One ffmpeg per file, frames at
+    ``capture.folder.video_rate_hz`` frames of video per second.
+    """
+    if not ffmpeg_available():
+        LOG.error("%d video(s) skipped: ffmpeg is not installed "
+                  "(sudo apt install ffmpeg)", len(videos))
+        return
+    # Raw video is the case phash dedupe exists for: turn it back on here and
+    # leave it off for the hand-picked images imported above.
+    writer.phash_min_distance = int(get_dotted(cfg, "capture.phash_min_distance", 6))
+    for vpath in videos:
+        if _STOP.is_set() or (max_frames and writer.kept >= max_frames):
+            break
+        LOG.info("decoding %s at %g fps", vpath, video_rate)
+        try:
+            for payload in iter_video(vpath, fps=video_rate):
+                rec = writer.write(payload, int(time.time() * 1e9))
+                if rec is not None:
+                    rec["original_name"] = vpath.name
+                    rec["source"] = "video"
+                    append_jsonl(manifest, rec)
+                if _STOP.is_set() or (max_frames and writer.kept >= max_frames):
+                    break
+        except Exception as exc:  # corrupt file, ffmpeg failure
+            LOG.error("%s: %s", vpath.name, exc)
+    writer.phash_min_distance = 0
 
 
 def args_folder_camera(cfg: dict) -> str:
@@ -554,10 +718,19 @@ def summarise(cfg: dict, session_dir: Path, manifest: Path, writers: dict,
     if kept == 0:
         print("\nNo frames kept. Common causes:")
         if not folder:
-            print(f"  - (profile {mower_profile_name(cfg)})")
-            for hint in silent_topic_hint(cfg):
-                print(f"  - {hint}")
-            print("  - the stream URL is wrong (run with --probe)")
+            modes = {w.spec.mode for w in writers.values()}
+            if modes == {"rtsp"}:
+                print(f"  - (profile {mower_profile_name(cfg)}, transport rtsp)")
+                print("  - the RTSP path is wrong — ask the relay what it publishes:")
+                print(f"      ffprobe {next(iter(writers.values())).spec.url}")
+                print("  - profiles.<profile>.rtsp_url does not match the relay's paths")
+                print("  - ffmpeg failed: its own message is in the log above "
+                      "(run with --probe)")
+            else:
+                print(f"  - (profile {mower_profile_name(cfg)})")
+                for hint in silent_topic_hint(cfg):
+                    print(f"  - {hint}")
+                print("  - the stream URL is wrong (run with --probe)")
         print("  - phash_min_distance too high for a moving scene (try 4, or 0)")
     else:
         print("\nnext: python3 scripts/02_llm_label.py "
@@ -584,10 +757,18 @@ def main(argv: list[str] | None = None) -> int:
     src.add_argument("--profile", choices=["ros1", "ros2"],
                      help="mower stack: ros1 = vendor firmware (8181), ros2 = the "
                           "ROS 2 port (8080); default: mower.profile")
+    src.add_argument("--transport", choices=["http", "rtsp"],
+                     help="how to pull the profile's cameras: http = "
+                          "web_video_server MJPEG (default), rtsp = the mediamtx "
+                          "relay, decoded by ffmpeg; default: mower.transport")
     src.add_argument("--topic", action="append", default=[], metavar="NAME=TOPIC",
                      help="ROS image topic on the mower (repeatable)")
     src.add_argument("--url", action="append", default=[], metavar="NAME=URL",
                      help="full MJPEG or snapshot URL (repeatable)")
+    src.add_argument("--rtsp", action="append", default=[], metavar="NAME=URL",
+                     help="explicit RTSP camera, e.g. "
+                          "left_oa=rtsp://192.168.1.105:8554/left_oa (repeatable; "
+                          "needs ffmpeg)")
     src.add_argument("--folder", help="import images from this local folder instead")
     src.add_argument("--cameras", help="comma list of cameras from the config "
                                        "(default: all of them)")
@@ -598,7 +779,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--rate", type=float, help="keep rate per stream, Hz")
     parser.add_argument("--max-frames", type=int, help="max frames per camera")
     parser.add_argument("--snapshot", action="store_true",
-                        help="force snapshot mode (one HTTP GET per frame)")
+                        help="force snapshot mode (one HTTP GET per frame; "
+                             "no effect on RTSP sources)")
     parser.add_argument("--probe", action="store_true",
                         help="check each stream for a frame, then exit")
     args = parser.parse_args(argv)
@@ -614,6 +796,8 @@ def main(argv: list[str] | None = None) -> int:
         cfg.setdefault("mower", {})["profile"] = args.profile
     if args.base_url:
         cfg.setdefault("mower", {})["base_url"] = args.base_url.rstrip("/")
+    if args.transport:
+        cfg.setdefault("mower", {})["transport"] = args.transport
 
     # Build the source list.
     specs: list[StreamSpec] = []
@@ -623,11 +807,14 @@ def main(argv: list[str] | None = None) -> int:
             LOG.error("folder not found: %s", folder)
             return 2
         if args.probe:
-            count = len(list_images(folder, bool(get_dotted(
-                cfg, "capture.folder.recursive", True)),
-                get_dotted(cfg, "capture.folder.extensions", [".jpg"])))
-            print(f"{count} images under {folder}")
-            return 0 if count else 1
+            recursive = bool(get_dotted(cfg, "capture.folder.recursive", True))
+            count = len(list_images(folder, recursive,
+                                    get_dotted(cfg, "capture.folder.extensions",
+                                               [".jpg"])))
+            vids = (list_videos(folder, recursive) if bool(get_dotted(
+                cfg, "capture.folder.videos", True)) else [])
+            print(f"{count} images and {len(vids)} videos under {folder}")
+            return 0 if (count or vids) else 1
         out = Path(args.out).expanduser() if args.out else cfg_path(cfg, "capture.out_dir")
         rate = args.rate if args.rate is not None else float(
             get_dotted(cfg, "capture.folder.rate_hz", 5.0))
@@ -636,6 +823,8 @@ def main(argv: list[str] | None = None) -> int:
         LOG.info("capturing classes: %s", ", ".join(class_names(cfg)))
         return run_folder_capture(cfg, folder, out, rate, maxf)["errors"]
 
+    if args.rtsp:
+        specs.extend(parse_rtsp_specs(args.rtsp, float(args.rate or 1.0)))
     if args.url:
         specs.extend(parse_url_specs(args.url))
     if args.topic:
@@ -652,8 +841,13 @@ def main(argv: list[str] | None = None) -> int:
                 LOG.error("no configured camera matched %s", sorted(wanted))
                 return 2
     if not specs:
-        LOG.error("no sources. Use --topic, --url or --folder, or check the "
+        LOG.error("no sources. Use --rtsp, --topic, --url or --folder, or check the "
                   "profiles.<mower.profile>.cameras block in the config.")
+        return 2
+
+    if any(s.mode == "rtsp" for s in specs) and not ffmpeg_available():
+        LOG.error("RTSP source requested but ffmpeg is not installed — "
+                  "sudo apt install ffmpeg (or brew install ffmpeg)")
         return 2
 
     if args.rate is not None:

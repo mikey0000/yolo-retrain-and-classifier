@@ -60,7 +60,8 @@ classes:
   recall_critical: [person, dog, cat, hedgehog, rabbit]
 
 # ---------------------------------------------------------------------------
-# Mower camera access — `web_video_server` MJPEG/snapshot over the LAN.
+# Mower camera access — `web_video_server` MJPEG/snapshot over the LAN, or
+# the mediamtx RTSP relay (see mower.transport below).
 #
 # Two stacks can be running on the mower, and they differ in port, topics and
 # whether the HTTP server is up at all. Pick one with `mower.profile` (or
@@ -72,7 +73,8 @@ classes:
 #   ros2  the ROS 2 port (airseekers-decompile/ros2_stack). web_video_server on
 #         8080 is OFF by default: launch cameras.launch.py web_video_server:=true.
 #         No start_capture services. RTSP on 8554 comes from mediamtx
-#         (docker/docker-compose.video.yml) and is for viewers; 01 reads HTTP.
+#         (docker/docker-compose.video.yml); 01 reads it with ffmpeg when
+#         mower.transport: rtsp.
 #
 # Which frames matter: the ROS 2 det_ros consumes ONLY /left_oa_camera and
 # /right_oa_camera (GC2093, 1920x1080), letterboxed to 480 wide x 640 tall
@@ -84,6 +86,10 @@ mower:
   profile: ros1                  # ros1 | ros2
   host: 192.168.1.105
   base_url: null                 # null -> http://<host>:<profiles.<profile>.port>
+  # http = web_video_server MJPEG/snapshot (default); rtsp = the mower's
+  # mediamtx relay, decoded by ffmpeg (profiles.<profile>.rtsp_url, needs
+  # the ffmpeg binary). --transport http|rtsp overrides this.
+  transport: http
   # web_video_server endpoints; {topic} is substituted by the camera's topic.
   stream_path: /stream?topic={topic}&type=mjpeg
   snapshot_path: /snapshot?topic={topic}
@@ -98,9 +104,14 @@ mower:
 #   mode: snapshot = one HTTP GET per kept frame (polite, lower steady cost)
 # `rate_hz` is the *keep* rate after dedupe. A top-level `cameras:` block, if
 # you add one, replaces the profile's list (older configs keep working).
+# With mower.transport: rtsp the mode is ignored and every camera is pulled
+# from `rtsp_url` instead; a camera may also set `rtsp:` to its own URL.
 profiles:
   ros1:
     port: 8181
+    # No rtsp_url: the vendor firmware's RTSP relay (if yours has one) is not
+    # documented here. Add `rtsp_url: rtsp://{host}:8554/{name}` and use
+    # `--transport rtsp` once you have confirmed the path with ffprobe.
     silent_hints:
       - "topic silent, or the camera needs: rosservice call {ns}/start_capture '{}'"
       - "(mower_cam_keeper.service normally does this when a viewer subscribes)"
@@ -133,7 +144,10 @@ profiles:
         note: rear view feeds mower_charge dock detection — keep the rate low
   ros2:
     port: 8080
-    rtsp: rtsp://<mower>:8554/{rear,left_oa}   # mediamtx relay, viewers only
+    # mediamtx relays every camera on :8554, named after the camera. Used when
+    # mower.transport: rtsp (or --transport rtsp). Placeholders: {host}
+    # (mower.host), {name} (camera, e.g. left_oa), {topic} (camera topic).
+    rtsp_url: rtsp://{host}:8554/{name}
     silent_hints:
       - "web_video_server is off by default in the ROS 2 stack:"
       - "  ros2 launch mower_bringup cameras.launch.py web_video_server:=true"
@@ -171,6 +185,9 @@ capture:
   reencode: false
   jpeg_quality: 90
   max_edge: 1280
+  # RTSP transport. tcp = reliable (frames arrive intact, a little latency);
+  # udp = lower latency but drops/reorders under load, which corrupts frames.
+  rtsp_transport: tcp
   quota_bytes: 2147483648        # 2 GiB per session: stop capturing, never raise
   total_quota_bytes: 12884901888  # 12 GiB across sessions: prune oldest first
   # Local-folder import instead of the mower (no mower needed).
@@ -179,7 +196,9 @@ capture:
     recursive: true
     extensions: [.jpg, .jpeg, .png, .bmp]
     rate_hz: 5.0
-    videos: false                # true -> also decode videos with ffmpeg
+    # Decode video files found in the folder too (needs ffmpeg, frames per
+    # second *of video*). Video frames get dedupe, curated image files do not.
+    videos: true
     video_rate_hz: 2.0
     camera_name: folder
 
