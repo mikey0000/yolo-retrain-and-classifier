@@ -72,16 +72,25 @@ classes:
 #         OA + rear cameras are gated behind `<cam>/start_capture`.
 #         Docs: airseekers-decompile/docs/streaming-and-telemetry.md.
 #   ros2  the ROS 2 port (airseekers-decompile/ros2_stack). web_video_server on
-#         8080 is OFF by default: launch cameras.launch.py web_video_server:=true.
-#         No start_capture services. RTSP on 8554 comes from mediamtx
-#         (docker/docker-compose.video.yml); 01 reads it with ffmpeg when
+#         8080, started by cameras.launch.py (web_video_server:=true is the
+#         default). No start_capture services: cameras publish on demand.
+#         RTSP on 8554 comes from mediamtx (docker/docker-compose.video.yml),
+#         which only relays `rear` and `left_oa`; 01 reads it with ffmpeg when
 #         mower.transport: rtsp.
 #
-# Which frames matter: the ROS 2 det_ros consumes ONLY /left_oa_camera and
-# /right_oa_camera (GC2093, 1920x1080), letterboxed to 480 wide x 640 tall
-# with black (0) padding. The OA cameras are therefore the primary capture
-# source in both profiles. The vendor ROS 1 det_ros additionally read
-# /vio/right/image_raw (640x480); it is kept in the ros1 profile as secondary.
+# Which frames matter: the ROS 2 det_ros (det_ros/config/det.yaml) runs the
+# model on FOUR streams, each letterboxed to 480 wide x 640 tall with black (0)
+# padding:
+#   /vio/right/image_color     front stereo RIGHT eye, colour, 640x480, ~3 Hz.
+#                              The forward view; det_range ranges its boxes into
+#                              the Nav2 costmaps -> the most safety-relevant feed.
+#   /left_oa_camera/image_raw  GC2093 obstacle-avoidance cameras at the front,
+#   /right_oa_camera/image_raw yawed +-90 deg and pitched down: SIDE views. Sensor
+#                              1920x1080, published 960x540 (oa_publish_width).
+#   /rear_camera/image_raw     USB webcam; det_ros subscribes only while
+#                              /vision/rear_watch is open (reversing, docking).
+# The vendor ROS 1 det_ros read the OA cameras (1920x1080 there) and the mono
+# /vio/right/image_raw (640x480).
 # ---------------------------------------------------------------------------
 mower:
   profile: ros2                  # ros1 | ros2
@@ -92,11 +101,14 @@ mower:
   # the ffmpeg binary). --transport http|rtsp overrides this.
   transport: http
   # web_video_server endpoints; {topic} is substituted by the camera's topic.
-  stream_path: /stream?topic={topic}&type=mjpeg
-  snapshot_path: /snapshot?topic={topic}
+  # qos_profile=sensor_data is required on ROS 2: the camera drivers publish
+  # best-effort and web_video_server's default (reliable) subscription gets
+  # nothing. The ROS 1 web_video_server ignores the parameter.
+  stream_path: /stream?topic={topic}&type=mjpeg&qos_profile=sensor_data
+  snapshot_path: /snapshot?topic={topic}&qos_profile=sensor_data
   connect_timeout_s: 5.0
   read_timeout_s: 30.0
-  # web_video_server is roughly single-threaded (ros2: server_threads 2): a
+  # web_video_server is roughly single-threaded (ros2: server_threads 1): a
   # held stream can block a concurrent request. Keep simultaneous streams few.
   max_concurrent_sources: 2
 
@@ -122,17 +134,17 @@ profiles:
         topic: /left_oa_camera/image_raw
         mode: snapshot
         rate_hz: 1.0
-        note: primary — det_ros input (GC2093 1920x1080); gated, needs start_capture
+        note: primary — vendor det_ros input (GC2093 1920x1080); gated, needs start_capture
       right_oa:
         topic: /right_oa_camera/image_raw
         mode: snapshot
         rate_hz: 1.0
-        note: primary — det_ros input (GC2093 1920x1080); gated, needs start_capture
+        note: primary — vendor det_ros input (GC2093 1920x1080); gated, needs start_capture
       front:
         topic: /vio/right/image_raw
         mode: stream
         rate_hz: 0.5
-        note: secondary — 640x480 stereo right eye; vendor ROS 1 det_ros read it, ROS 2 det_ros does not
+        note: secondary — 640x480 mono stereo right eye; vendor ROS 1 det_ros read it (the ROS 2 det_ros reads its colour twin /vio/right/image_color)
       front_left:
         topic: /vio/left/image_raw
         mode: stream
@@ -145,45 +157,51 @@ profiles:
         note: rear view feeds mower_charge dock detection — keep the rate low
   ros2:
     port: 8080
-    # mediamtx relays every camera on :8554, named after the camera. Used when
-    # mower.transport: rtsp (or --transport rtsp). Placeholders: {host}
-    # (mower.host), {name} (camera, e.g. left_oa), {topic} (camera topic).
+    # mediamtx on :8554 relays only `rear` and `left_oa` (docker/mediamtx/
+    # mediamtx.yml). Used when mower.transport: rtsp (or --transport rtsp).
+    # Placeholders: {host} (mower.host), {name} (camera), {topic} (camera
+    # topic). Cameras with no relay path set `rtsp: false` and stay on HTTP.
     rtsp_url: rtsp://{host}:8554/{name}
     silent_hints:
-      - "web_video_server is off by default in the ROS 2 stack:"
-      - "  ros2 launch mower_bringup cameras.launch.py web_video_server:=true"
+      - "is web_video_server up? cameras.launch.py starts it on 8080 (web_video_server:=true)"
       - "check the topic on the mower: ros2 topic hz {topic}"
       - "topic list: http://<mower>:8080/"
     # `enabled: false` cameras are captured only when named in --cameras.
     # `reference:` = a topic saved next to every kept frame. The onboard
     # detector's annotated image shows what the deployed model thinks is an
     # object; 02 shows it to the VLM as a hint to correct, review_sheet.py
-    # puts it beside the VLM's boxes for validation.
+    # puts it beside the VLM's boxes for validation. det_ros publishes one per
+    # camera (/<camera_ns>/image_annotated, same size as the input); the merged
+    # /ai/det/image_annotated mixes all four cameras, so don't use it here.
+    # All four cameras below are det_ros inputs; names match
+    # export.rknn.calib_camera_weights.
     cameras:
       front:
-        topic: /vio/right/image_raw
+        topic: /vio/right/image_color
         mode: stream
         rate_hz: 1.0
-        reference: /ai/det/image_annotated
-        note: default capture source — stereo right eye
+        reference: /vio/right/image_annotated
+        rtsp: false                  # no mediamtx path for it: HTTP only
+        note: default capture source — forward colour stereo eye (640x480, ~3 Hz); feeds the Nav2 costmaps
       left_oa:
         topic: /left_oa_camera/image_raw
         mode: stream
         rate_hz: 1.0
         enabled: false
-        note: det_ros input (GC2093 1920x1080)
+        note: det_ros input — left side-looking OA camera (GC2093, published 960x540)
       right_oa:
         topic: /right_oa_camera/image_raw
         mode: stream
         rate_hz: 1.0
         enabled: false
-        note: det_ros input (GC2093 1920x1080)
+        rtsp: false                  # mediamtx relays left_oa only
+        note: det_ros input — right side-looking OA camera (GC2093, published 960x540)
       rear:
         topic: /rear_camera/image_raw
         mode: snapshot
         rate_hz: 0.25
         enabled: false
-        note: not a det_ros input; extra data only, keep the rate low
+        note: det_ros input only while reversing/docking (/vision/rear_watch); docking uses it too, keep the rate low
 
 capture:
   session: null                  # null -> timestamped, e.g. 20261005-142530
@@ -382,11 +400,19 @@ export:
     calib_count: 300
     calib_from: dataset           # dataset (dataset_dir/images) | frames (frames_dir)
     # Share of the calibration set per camera (manifest `camera`), normalised.
-    # det_ros only ever sees the OA cameras, so they get most of the budget.
-    # '*' covers every other camera; cameras with no frames donate their share.
+    # The ROS 2 det_ros runs on four streams. `front` (/vio/right/image_color,
+    # 640x480 -> 480x360 + 140 px bands) is the forward view whose detections
+    # reach the Nav2 costmaps, so it gets the largest share. The side OA
+    # cameras run continuously (960x540 -> 480x270 + 185 px bands) and share
+    # the next half. `rear` is only fed to det_ros while reversing/docking, and
+    # letterboxes like the OA frames, so it gets the smallest share. '*' covers
+    # every other camera (folder imports, ros1 front_left); it only matters
+    # when such frames are present. Cameras with no frames donate their share.
     calib_camera_weights:
-      left_oa: 0.4
-      right_oa: 0.4
-      "*": 0.2
+      front: 0.35
+      left_oa: 0.25
+      right_oa: 0.25
+      rear: 0.15
+      "*": 0.1
     output_name: best_22cls.rknn
     verify_metadata: true         # check input shape / output count of the .rknn

@@ -7,9 +7,9 @@ Rockchip `.rknn` that the ROS 2 `det_ros` node can load.
 Everything runs on **your LAN host**. The mower is only read (HTTP or RTSP),
 and nothing is installed or written on it. Its camera servers must be up,
 though: on the vendor ROS 1 firmware `web_video_server` (port 8181) is always
-running; on the ROS 2 port it is off until you launch
-`cameras.launch.py web_video_server:=true` (port 8080), while the mediamtx
-RTSP relay (port 8554) is always up.
+running; on the ROS 2 port `cameras.launch.py` starts it on port 8080
+(`web_video_server:=true` is the default), and the mediamtx RTSP relay
+(port 8554, `rear` and `left_oa` only) runs when the video compose file is up.
 
 **Setup is one command: `./setup.sh`** (Linux, macOS or Windows-under-WSL —
 see [Setup](#setup)).
@@ -57,12 +57,18 @@ From `airseekers-decompile/ros2_stack/src/det_ros` and
 | Outputs | 9 tensors, `[box, cls, score_sum]` per stride: `[1,64,80,60] [1,22,80,60] [1,1,80,60] [1,64,40,30] [1,22,40,30] [1,1,40,30] [1,64,20,15] [1,22,20,15] [1,1,20,15]`. box = DFL, reg_max 16; cls already sigmoid (airockchip head); score_sum ignored |
 | Quantisation | asymmetric int8, per-**layer**, target rk3588, rknn-toolkit2 2.3.0 |
 | Classes | 22, order = `pipeline.yaml classes.names` = `det.yaml classes` = `labels.py BEST_LARGE_CLASSES` |
-| Cameras | ROS 2 det_ros reads **only** `/left_oa_camera/image_raw` and `/right_oa_camera/image_raw` (GC2093, 1920×1080). The vendor ROS 1 node also read `/vio/right/image_raw` (640×480) |
+| Cameras | ROS 2 det_ros (`det.yaml`, `max_rate_hz` 5 per camera) reads **four** streams: `/vio/right/image_color` — front Metoak stereo right eye, colour, 640×480, ~3 Hz, the **forward** view whose boxes `det_range` ranges into the Nav2 costmaps; `/left_oa_camera/image_raw` and `/right_oa_camera/image_raw` — GC2093 OA cameras at the front but yawed ±90° and pitched down, i.e. **side** views, sensor 1920×1080 published at **960×540** (`oa_publish_width`, ≤ 10 Hz, on demand); `/rear_camera/image_raw` — USB webcam (1280×720 live, up to 15 Hz), fed to det_ros **only** while `/vision/rear_watch` is open (reversing, docking, +5 s). The vendor ROS 1 node read the OA cameras at 1920×1080 and the mono `/vio/right/image_raw` (640×480) |
 
-A 1920×1080 OA frame therefore reaches the model as a 480×270 image with
-185-pixel black bands above and below. That is why the OA cameras are the
-primary capture source, and why the int8 calibration set is letterboxed the same
-way (05).
+The letterbox is size-agnostic, but the bands differ per camera: a 960×540 OA
+frame (or 1920×1080 on ROS 1) and a 1280×720 rear frame reach the model as a
+480×270 image with 185-pixel black bands above and below; a 640×480 front frame
+becomes 480×360 with 140-pixel bands. The front colour eye is the default
+capture source because it is the feed that reaches the costmaps; the OA and rear
+cameras are in the preset too, and the int8 calibration set is weighted across
+all four and letterboxed the same way (05). Keep the living classes (person,
+dog, cat, hedgehog, rabbit) accurate: the mower_map obstacle tracker vetoes them
+from becoming permanent keep-outs, so a miss or a wrong class there changes
+behaviour.
 
 ---
 
@@ -147,10 +153,11 @@ llm:
   model: qwen/qwen3.6-27b  # a vision model loaded in LM Studio (`lms ls`)
 ```
 
-The default ROS 2 capture camera is `front` = `/vio/right/image_raw`, paired
-with the onboard detector's `/ai/det/image_annotated` (see 01, "Reference
-frames"). The other cameras are `enabled: false` and captured with
-`--cameras left_oa,right_oa,...`. The topic list is at
+The default ROS 2 capture camera is `front` = `/vio/right/image_color` (the
+colour forward eye det_ros reads), paired with the onboard detector's
+annotated image of that camera, `/vio/right/image_annotated` (see 01,
+"Reference frames"). The other det_ros inputs are `enabled: false` and captured
+with `--cameras front,left_oa,right_oa,rear`. The topic list is at
 `http://<mower>:8080/`.
 
 Every value can also be overridden per run without editing the file:
@@ -276,10 +283,10 @@ Two profiles (`mower.profile`, or `--profile`):
 
 | | `ros1` (vendor firmware) | `ros2` (the ROS 2 port) |
 |---|---|---|
-| HTTP port | 8181, always on | 8080, **off by default** — `ros2 launch mower_bringup cameras.launch.py web_video_server:=true` |
-| Cameras in the preset | `left_oa`, `right_oa` (primary, 1 Hz), `front` = `/vio/right` (0.5 Hz), `front_left` = `/vio/left` (0.25 Hz), `rear` (0.25 Hz) | `left_oa`, `right_oa` (primary, 1 Hz), `rear` (0.25 Hz) |
-| Gating | OA + rear need `rosservice call /<cam>/start_capture "{}"` | no start_capture services |
-| RTSP | — | 8554 via mediamtx (`docker/docker-compose.video.yml`) — 01 reads it with ffmpeg, `--transport rtsp` |
+| HTTP port | 8181, always on | 8080, started by `cameras.launch.py` (`web_video_server:=true` is the default); URLs need `&qos_profile=sensor_data` (in the default `stream_path`/`snapshot_path`) |
+| Cameras in the preset | `left_oa`, `right_oa` (primary, 1920×1080, 1 Hz), `front` = `/vio/right/image_raw` mono (0.5 Hz), `front_left` = `/vio/left` (0.25 Hz), `rear` (0.25 Hz) | `front` = `/vio/right/image_color` (640×480 colour, default, 1 Hz), `left_oa`, `right_oa` (side views, 960×540, 1 Hz), `rear` (0.25 Hz) — all four are det_ros inputs |
+| Gating | OA + rear need `rosservice call /<cam>/start_capture "{}"` | no start_capture services; cameras publish while subscribed |
+| RTSP | — | 8554 via mediamtx (`docker/docker-compose.video.yml`), paths `rear` and `left_oa` only — 01 reads them with ffmpeg, `--transport rtsp`; `front` and `right_oa` are `rtsp: false` and stay on HTTP |
 
 Check what's answering first. `--probe` fetches one frame per camera through
 the exact URL capture would use (streams are read until the first JPEG, then
@@ -315,11 +322,11 @@ probing rtsp://192.168.1.105:8554  (profile ros2, transport rtsp)
 Then capture:
 
 ```bash
-# every camera in the profile's preset, 60 s, rates from the config
+# every enabled camera in the profile's preset, 60 s, rates from the config
 python3 scripts/01_capture.py
 
-# just what det_ros consumes
-python3 scripts/01_capture.py --cameras left_oa,right_oa --duration 120
+# everything the ROS 2 det_ros consumes (mind mower.max_concurrent_sources)
+python3 scripts/01_capture.py --cameras front,left_oa,right_oa,rear --duration 120
 
 # explicit base URL + topics
 python3 scripts/01_capture.py \
@@ -340,8 +347,13 @@ thread per camera, so a silent snapshot topic cannot stall the others.
 
 ### The same mower over RTSP
 
-The ROS 2 stack relays every camera through mediamtx on port **8554**, named
-after the camera (`rtsp://<mower>:8554/left_oa`). 01 pulls those directly with
+The ROS 2 stack relays `rear` and `left_oa` through mediamtx on port **8554**,
+named after the camera (`rtsp://<mower>:8554/left_oa`; each is ffmpeg re-encoding
+the web_video_server MJPEG at 1280×720, 10 fps). There is no relay path for
+`right_oa` or the front colour eye — capture those over HTTP
+(`http://<mower>:8080/stream?topic=/vio/right/image_color&qos_profile=sensor_data`
+or `/snapshot?topic=...`); in the preset they are `rtsp: false`, so
+`--transport rtsp` leaves them on HTTP. 01 pulls the relayed paths directly with
 one ffmpeg per camera — useful when `web_video_server` is off, busy, or you
 would rather not run it at all:
 
@@ -349,12 +361,13 @@ would rather not run it at all:
 sudo apt install ffmpeg        # system package; `./setup.sh --check` reports it
 
 python3 scripts/01_capture.py --rtsp left_oa=rtsp://192.168.1.105:8554/left_oa
-python3 scripts/01_capture.py --transport rtsp --cameras left_oa,right_oa
+python3 scripts/01_capture.py --transport rtsp --cameras left_oa,rear
 # ...or make it the default:  mower.transport: rtsp  in config/pipeline.yaml
 ```
 
 `profiles.ros2.rtsp_url` is the URL template (`rtsp://{host}:8554/{name}`; a
-camera may set `rtsp: <url>` on its own to opt in individually). ffmpeg
+camera may set `rtsp: <url>` on its own to opt in individually, or
+`rtsp: false` to stay on HTTP). ffmpeg
 decimates to the camera's `rate_hz`, and dedupe, quota and the manifest behave
 exactly as over HTTP — a dropped feed reconnects with a short backoff instead
 of ending the session. Transport is TCP by default (`capture.rtsp_transport`)
@@ -397,7 +410,9 @@ came from (03 records it in provenance, 05 stratifies calibration by it):
 manifest yourself, 03 can split by pose cell (see 03).
 
 **Reference frames (onboard detector).** A camera with `reference: <topic>`
-(on `front`: `/ai/det/image_annotated`) holds that topic on one MJPEG
+(on `front`: `/vio/right/image_annotated`; det_ros publishes one per camera,
+`/<camera_ns>/image_annotated`, while the merged `/ai/det/image_annotated`
+mixes all four cameras) holds that topic on one MJPEG
 connection and, for every kept raw frame, saves the latest reference frame
 (≤ `capture.reference_max_age_s` old) to
 `work/reference/<session>/<camera>/<same name>.jpg`. The manifest gets
@@ -408,8 +423,9 @@ turns it off; `--reference <topic>` sets it for `--topic` sources.
 **Notes**
 
 - **Don't leave the rear camera streaming while docked** on the vendor
-  firmware: `mower_charge` reads `/rear_camera/image_raw` for dock detection.
-  That's why `rear` is capped at 0.25 Hz in both presets.
+  firmware: `mower_charge` reads `/rear_camera/image_raw` for dock detection
+  (on ROS 2 docking uses it too). That's why `rear` is capped at 0.25 Hz in
+  both presets.
 - **Near-duplicate rejection is on** (`phash_min_distance: 6`). A parked mower
   emits identical frames at the full topic rate and would otherwise write
   hundreds of copies of the same picture. After `stop_after_dup_run` (5)
@@ -688,8 +704,9 @@ NCHW `[1,3,640,480]` (640 tall, 480 wide, feature maps 80×60 / 40×30 / 20×15)
 is fixed at **export** time by `export.imgsz: [640, 480]` in 05.
 
 One mismatch remains and is worth knowing: ultralytics letterboxes with grey
-(114) padding, while det_ros pads with **black (0)** and a 1920×1080 OA frame
-arrives with 185-px black bands top and bottom. The calibration set (05) is
+(114) padding, while det_ros pads with **black (0)**: a 960×540 OA or 1280×720
+rear frame arrives with 185-px black bands top and bottom, a 640×480 front
+frame with 140-px bands. The calibration set (05) is
 letterboxed the det_ros way; training data is not. Check field behaviour near
 the bands before trusting val mAP.
 
@@ -791,10 +808,14 @@ int8 ranges are calibrated on `calib_count` (300) frames from these cameras
 (`calib_from: dataset` = `<convert.dataset_dir>/images`, or `frames` =
 `paths.frames_dir`; both from the config). The set is **stratified by the
 manifest's `camera`**, weighted by `export.rknn.calib_camera_weights` (default
-`left_oa: 0.4, right_oa: 0.4, "*": 0.2` — det_ros only sees the OA cameras), and
+`front: 0.35, left_oa: 0.25, right_oa: 0.25, rear: 0.15, "*": 0.1` — det_ros
+runs on all four cameras; the forward colour eye feeds the costmaps and gets the
+largest share, the side OA cameras run continuously, the rear only while
+reversing/docking; `"*"` only matters for other cameras such as folder imports;
+shares are normalised over the cameras that have frames), and
 every image is **pre-letterboxed to 480×640 with black padding** exactly like
 `mower_rknn.preprocess.letterbox` into a temporary directory, so the toolkit
-never stretches a 1920×1080 frame. Cameras with no frames donate their share;
+never stretches a 960×540, 640×480 or 1280×720 frame. Cameras with no frames donate their share;
 frames without a manifest entry count as camera `unknown`.
 
 ### Output contract self-check
@@ -831,7 +852,7 @@ A caveat worth internalising: **your val labels are LLM suggestions**, so mAP
 measures "did the model fit the suggestions", not "is the model correct". Hand-
 labelled holdout frames from the `review/` queue are the only real metric. Get
 the baseline by scoring the current node's own behaviour (the annotated image,
-`/ai/det/image_annotated` on ROS 2) on a fixed frame set by hand — a rough
+`/<camera_ns>/image_annotated` per camera on ROS 2) on a fixed frame set by hand — a rough
 baseline beats none.
 
 Day and night is not optional. The mower ships a `light_ai` classifier precisely
@@ -898,8 +919,11 @@ sourcing:
   `yolo_postprocess.py` (the 9-output decode)
 - `ros2_stack/src/mower_rknn/mower_rknn/preprocess.py` — letterbox (pad 0) and
   RGB NHWC conversion
-- `ros2_stack/launch/cameras.launch.py` — OA/rear cameras (1920×1080),
-  `web_video_server:=true` on 8080
+- `ros2_stack/src/mower_bringup/launch/cameras.launch.py` — OA cameras (sensor
+  1920×1080, published 960×540), rear webcam, front stereo
+  (`/vio/right/image_color`), web_video_server on 8080
+- `ros2_stack/docs/cameras_and_video.md` — MJPEG/snapshot/RTSP URLs
+  (`qos_profile=sensor_data`), mediamtx paths
 - `docs/streaming-and-telemetry.md` — vendor camera map, MJPEG/RTSP setup
 - `mower_docs/03-yolo-perception.md` — the model I/O contract
 - `ros2_stack/docs/yolo_retrain_pipeline.md` — the design document this
@@ -912,6 +936,25 @@ sourcing:
 ---
 
 ## CHANGELOG
+
+### 2026-10-13 — camera facts follow the live ROS 2 det_ros
+
+- **det_ros reads four cameras, not two.** `det.yaml` runs the model on
+  `/vio/right/image_color` (forward, 640×480, feeds the Nav2 costmaps), the
+  two OA cameras (side-looking, published 960×540 on ROS 2) and the rear
+  webcam (1280×720, gated by `/vision/rear_watch`). This supersedes the
+  2026-10-06 "OA cameras are primary (H6)" entry.
+- **ros2 preset:** `front` is now the colour eye `/vio/right/image_color`
+  (was the mono `/vio/right/image_raw`, which det_ros does not read), with
+  reference `/vio/right/image_annotated` (was the merged
+  `/ai/det/image_annotated`, which mixes cameras). `front` and `right_oa` are
+  `rtsp: false` (mediamtx relays only `rear` and `left_oa`); new camera key
+  `rtsp: false` keeps a camera on HTTP under `--transport rtsp`.
+- **`qos_profile=sensor_data`** is in the default `stream_path` /
+  `snapshot_path`: the ROS 2 web_video_server receives nothing from the
+  best-effort camera topics without it.
+- **Calibration weights** `front 0.35, left_oa 0.25, right_oa 0.25,
+  rear 0.15, "*" 0.1` (were `left_oa 0.4, right_oa 0.4, "*" 0.2`).
 
 ### 2026-10-09 — RTSP capture and video files for 01
 
